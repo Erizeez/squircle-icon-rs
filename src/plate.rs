@@ -158,21 +158,42 @@ pub fn detect_icon_profile(pixmap: &Pixmap) -> IconProfile {
     // 4. PreFramedSquircle detection (inner card with transparent padding):
     // macOS Big Sur standard: 824px in 1024px canvas (~80.5% width/height).
     // The continuous squircle fills ~91-96% of its bounding box.
+    // In addition, all four boundary edges (top, bottom, left, right) must span >= 60% of the box
+    // to strictly distinguish cards from T-shaped objects (monitors with stands), triangles, etc.
     if w_ratio >= 0.70 && w_ratio <= 0.92 && h_ratio >= 0.70 && h_ratio <= 0.92
         && (w_ratio - h_ratio).abs() < 0.10 && box_fill_ratio >= 0.88
     {
-        let sx = w as f32 / box_w as f32;
-        let sy = h as f32 / box_h as f32;
-        let s = sx.min(sy) * 1.02; // slight bleed margin to ensure seamless edge
-        let cx = (min_x + max_x) as f32 / 2.0;
-        let cy = (min_y + max_y) as f32 / 2.0;
-        let offset_x = (w as f32 / 2.0) - cx * s;
-        let offset_y = (h as f32 / 2.0) - cy * s;
-        return IconProfile::PreFramedSquircle {
-            scale: s,
-            offset_x,
-            offset_y,
-        };
+        let inset_y = (box_h / 16).max(3);
+        let y_top = min_y + inset_y;
+        let y_bot = max_y.saturating_sub(inset_y);
+        let top_span = (min_x..=max_x).filter(|&x| pixmap.pixel(x, y_top).map_or(false, |p| p.alpha() > 32)).count();
+        let bot_span = (min_x..=max_x).filter(|&x| pixmap.pixel(x, y_bot).map_or(false, |p| p.alpha() > 32)).count();
+
+        let inset_x = (box_w / 16).max(3);
+        let x_left = min_x + inset_x;
+        let x_right = max_x.saturating_sub(inset_x);
+        let left_span = (min_y..=max_y).filter(|&y| pixmap.pixel(x_left, y).map_or(false, |p| p.alpha() > 32)).count();
+        let right_span = (min_y..=max_y).filter(|&y| pixmap.pixel(x_right, y).map_or(false, |p| p.alpha() > 32)).count();
+
+        let is_squircle_card = (top_span as f32 / box_w as f32) >= 0.60
+            && (bot_span as f32 / box_w as f32) >= 0.60
+            && (left_span as f32 / box_h as f32) >= 0.60
+            && (right_span as f32 / box_h as f32) >= 0.60;
+
+        if is_squircle_card {
+            let sx = w as f32 / box_w as f32;
+            let sy = h as f32 / box_h as f32;
+            let s = sx.min(sy) * 1.02; // slight bleed margin to ensure seamless edge
+            let cx = (min_x + max_x) as f32 / 2.0;
+            let cy = (min_y + max_y) as f32 / 2.0;
+            let offset_x = (w as f32 / 2.0) - cx * s;
+            let offset_y = (h as f32 / 2.0) - cy * s;
+            return IconProfile::PreFramedSquircle {
+                scale: s,
+                offset_x,
+                offset_y,
+            };
+        }
     }
 
     // 4. Circle with uniform rim detection (e.g. Moonlight):
@@ -257,16 +278,21 @@ pub fn apply_squircle_plate(source: &Pixmap, options: PlateOptions) -> Pixmap {
         PlateTheme::Dark => Color::from_rgba8(255, 255, 255, 30),
     };
 
+    let pixmap_paint = PixmapPaint {
+        quality: tiny_skia::FilterQuality::Bicubic,
+        ..Default::default()
+    };
+
     match profile {
         IconProfile::FullBleed => {
             // Full-bleed: render at scale 1.0 covering the tile, clipped to squircle
-            output.draw_pixmap(0, 0, source.as_ref(), &PixmapPaint::default(), Transform::identity(), Some(&mask));
+            output.draw_pixmap(0, 0, source.as_ref(), &pixmap_paint, Transform::identity(), Some(&mask));
         }
         IconProfile::PreFramedSquircle { scale, offset_x, offset_y } => {
             // Adaptive Fusion (Apifox, PeaZip, Antigravity):
-            // Scale and center the existing squircle card to fill the canvas seamlessly
+            // Scale and center the existing squircle card to fill the canvas seamlessly with Bicubic filtering
             let transform = Transform::from_scale(scale, scale).post_translate(offset_x, offset_y);
-            output.draw_pixmap(0, 0, source.as_ref(), &PixmapPaint::default(), transform, Some(&mask));
+            output.draw_pixmap(0, 0, source.as_ref(), &pixmap_paint, transform, Some(&mask));
         }
         IconProfile::UniformColoredCircle { top_color, bottom_color } => {
             // Circular icon with uniform rim (e.g. Moonlight):
@@ -289,10 +315,10 @@ pub fn apply_squircle_plate(source: &Pixmap, options: PlateOptions) -> Pixmap {
             let dx = (w - (w * scale)) / 2.0;
             let dy = (h - (h * scale)) / 2.0;
             let transform = Transform::from_scale(scale, scale).post_translate(dx, dy);
-            output.draw_pixmap(0, 0, source.as_ref(), &PixmapPaint::default(), transform, Some(&mask));
+            output.draw_pixmap(0, 0, source.as_ref(), &pixmap_paint, transform, Some(&mask));
         }
         IconProfile::FloatingCutout => {
-            // Floating glyph / cutout (Chrome, CMake, Fcitx5):
+            // Floating glyph / cutout (Chrome, CMake, Fcitx5, lstopo):
             // Render Apple-style subtle gradient plate and center glyph
             let (top_color, bottom_color) = match options.theme {
                 PlateTheme::Light => (Color::WHITE, Color::from_rgba8(242, 242, 247, 255)),
@@ -316,11 +342,11 @@ pub fn apply_squircle_plate(source: &Pixmap, options: PlateOptions) -> Pixmap {
             let dx = (w - (w * scale)) / 2.0;
             let dy = (h - (h * scale)) / 2.0;
             let transform = Transform::from_scale(scale, scale).post_translate(dx, dy);
-            output.draw_pixmap(0, 0, source.as_ref(), &PixmapPaint::default(), transform, Some(&mask));
+            output.draw_pixmap(0, 0, source.as_ref(), &pixmap_paint, transform, Some(&mask));
         }
     }
 
-    // Subtle hairline inner border
+    // Subtle hairline inner border clipped strictly inside squircle
     let border_width = (w / 128.0).max(1.0);
     let mut stroke_paint = Paint::default();
     stroke_paint.set_color(border_color);
@@ -328,7 +354,7 @@ pub fn apply_squircle_plate(source: &Pixmap, options: PlateOptions) -> Pixmap {
         width: border_width,
         ..Default::default()
     };
-    output.stroke_path(&path, &stroke_paint, &stroke, Transform::identity(), None);
+    output.stroke_path(&path, &stroke_paint, &stroke, Transform::identity(), Some(&mask));
 
     output
 }
@@ -413,6 +439,8 @@ mod tests {
             ("Apifox", "/var/lib/flatpak/appstream/flathub/x86_64/70da372709099bbdd422326b03f09cdf46afe365999abb4aac127a5b9bc7f0ad/icons/128x128/com.apifox.Apifox.png", "squircle"),
             ("PeaZip", "/var/lib/flatpak/appstream/flathub/x86_64/70da372709099bbdd422326b03f09cdf46afe365999abb4aac127a5b9bc7f0ad/icons/128x128/io.github.peazip.PeaZip.png", "squircle"),
             ("Antigravity", "/home/eriz/.local/share/icons/hicolor/512x512/apps/antigravity.png", "squircle"),
+            ("Clash Verge", "/usr/share/icons/hicolor/128x128/apps/clash-verge.png", "cutout"),
+            ("lstopo (hwloc)", "/home/eriz/.local/share/icons/hicolor/scalable/apps/hwloc.svg", "cutout"),
             ("WeChat", "/usr/share/icons/hicolor/128x128/apps/wechat.png", "full_bleed"),
             ("CMake", "/usr/share/icons/hicolor/128x128/apps/CMakeSetup.png", "cutout"),
         ];

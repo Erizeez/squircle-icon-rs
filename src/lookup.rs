@@ -70,8 +70,11 @@ fn resolve_icon_uncached(icon_name: &str) -> Option<PathBuf> {
 
     let roots = icon_search_roots();
     let themes = ["hicolor", "Adwaita", "breeze", "gnome"];
-    // Prefer scalable SVGs first, then descending raster resolutions
-    let sizes = ["scalable", "512x512", "256x256", "128x128", "96x96", "64x64", "48x48", "32x32"];
+    // Prefer scalable SVGs first, then descending raster resolutions (including @2 high-DPI)
+    let sizes = [
+        "scalable", "1024x1024", "512x512@2", "512x512", "256x256@2", "256x256",
+        "128x128@2", "128x128", "96x96", "64x64", "48x48", "32x32",
+    ];
     let categories = ["apps", "mimetypes", "categories", "status", "places"];
 
     for root in &roots {

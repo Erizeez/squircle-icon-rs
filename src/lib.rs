@@ -284,4 +284,17 @@ mod tests {
             assert!(s.contains("data:image/png;base64,"));
         }
     }
+
+    #[test]
+    fn test_render_system_apps_at_256() {
+        let apps = ["clash-verge", "antigravity", "hwloc", "com.apifox.Apifox"];
+        let scratch_dir = Path::new("/home/eriz/.gemini/antigravity-cli/brain/308e8b3f-0aba-4c30-9671-c150b5adb7a4/scratch");
+        for app in apps {
+            if let Some(bitmap) = render_icon(app, 256, PlateOptions::default()) {
+                if scratch_dir.exists() {
+                    let _ = bitmap.pixmap().save_png(scratch_dir.join(format!("test_render_256_{app}.png")));
+                }
+            }
+        }
+    }
 }
