@@ -113,7 +113,7 @@ pub fn detect_icon_profile(pixmap: &Pixmap) -> IconProfile {
     ];
     let corners_opaque = corners
         .iter()
-        .all(|&(x, y)| pixmap.pixel(x, y).map_or(false, |p| p.alpha() > 200));
+        .all(|&(x, y)| pixmap.pixel(x, y).is_some_and(|p| p.alpha() > 200));
     if corners_opaque {
         return IconProfile::FullBleed;
     }
@@ -127,14 +127,14 @@ pub fn detect_icon_profile(pixmap: &Pixmap) -> IconProfile {
 
     for y in 0..h {
         for x in 0..w {
-            if let Some(p) = pixmap.pixel(x, y) {
-                if p.alpha() > 32 {
-                    opaque_count += 1;
-                    min_x = min_x.min(x);
-                    max_x = max_x.max(x);
-                    min_y = min_y.min(y);
-                    max_y = max_y.max(y);
-                }
+            if let Some(p) = pixmap.pixel(x, y)
+                && p.alpha() > 32
+            {
+                opaque_count += 1;
+                min_x = min_x.min(x);
+                max_x = max_x.max(x);
+                min_y = min_y.min(y);
+                max_y = max_y.max(y);
             }
         }
     }
@@ -160,20 +160,30 @@ pub fn detect_icon_profile(pixmap: &Pixmap) -> IconProfile {
     // The continuous squircle fills ~91-96% of its bounding box.
     // In addition, all four boundary edges (top, bottom, left, right) must span >= 60% of the box
     // to strictly distinguish cards from T-shaped objects (monitors with stands), triangles, etc.
-    if w_ratio >= 0.70 && w_ratio <= 0.92 && h_ratio >= 0.70 && h_ratio <= 0.92
-        && (w_ratio - h_ratio).abs() < 0.10 && box_fill_ratio >= 0.88
+    if (0.70..=0.92).contains(&w_ratio)
+        && (0.70..=0.92).contains(&h_ratio)
+        && (w_ratio - h_ratio).abs() < 0.10
+        && box_fill_ratio >= 0.88
     {
         let inset_y = (box_h / 16).max(3);
         let y_top = min_y + inset_y;
         let y_bot = max_y.saturating_sub(inset_y);
-        let top_span = (min_x..=max_x).filter(|&x| pixmap.pixel(x, y_top).map_or(false, |p| p.alpha() > 32)).count();
-        let bot_span = (min_x..=max_x).filter(|&x| pixmap.pixel(x, y_bot).map_or(false, |p| p.alpha() > 32)).count();
+        let top_span = (min_x..=max_x)
+            .filter(|&x| pixmap.pixel(x, y_top).is_some_and(|p| p.alpha() > 32))
+            .count();
+        let bot_span = (min_x..=max_x)
+            .filter(|&x| pixmap.pixel(x, y_bot).is_some_and(|p| p.alpha() > 32))
+            .count();
 
         let inset_x = (box_w / 16).max(3);
         let x_left = min_x + inset_x;
         let x_right = max_x.saturating_sub(inset_x);
-        let left_span = (min_y..=max_y).filter(|&y| pixmap.pixel(x_left, y).map_or(false, |p| p.alpha() > 32)).count();
-        let right_span = (min_y..=max_y).filter(|&y| pixmap.pixel(x_right, y).map_or(false, |p| p.alpha() > 32)).count();
+        let left_span = (min_y..=max_y)
+            .filter(|&y| pixmap.pixel(x_left, y).is_some_and(|p| p.alpha() > 32))
+            .count();
+        let right_span = (min_y..=max_y)
+            .filter(|&y| pixmap.pixel(x_right, y).is_some_and(|p| p.alpha() > 32))
+            .count();
 
         let is_squircle_card = (top_span as f32 / box_w as f32) >= 0.60
             && (bot_span as f32 / box_w as f32) >= 0.60
@@ -198,7 +208,7 @@ pub fn detect_icon_profile(pixmap: &Pixmap) -> IconProfile {
 
     // 4. Circle with uniform rim detection (e.g. Moonlight):
     // Circle fills pi/4 = ~78.5% of its bounding box.
-    if box_fill_ratio >= 0.73 && box_fill_ratio <= 0.84 && w_ratio >= 0.85 && h_ratio >= 0.85 {
+    if (0.73..=0.84).contains(&box_fill_ratio) && w_ratio >= 0.85 && h_ratio >= 0.85 {
         let mid_x = (min_x + max_x) / 2;
         let mid_y = (min_y + max_y) / 2;
         let p_top = pixmap.pixel(mid_x, (min_y + 4).min(max_y));
@@ -206,17 +216,20 @@ pub fn detect_icon_profile(pixmap: &Pixmap) -> IconProfile {
         let p_left = pixmap.pixel((min_x + 4).min(max_x), mid_y);
         let p_right = pixmap.pixel((max_x.saturating_sub(4)).max(min_x), mid_y);
 
-        if let (Some(top), Some(bot), Some(left), Some(right)) = (p_top, p_bot, p_left, p_right) {
-            if top.alpha() > 200 && bot.alpha() > 200 && left.alpha() > 200 && right.alpha() > 200 {
-                let diff_lr = (left.red() as i32 - right.red() as i32).abs()
-                    + (left.green() as i32 - right.green() as i32).abs()
-                    + (left.blue() as i32 - right.blue() as i32).abs();
-                if diff_lr < 30 {
-                    return IconProfile::UniformColoredCircle {
-                        top_color: Color::from_rgba8(top.red(), top.green(), top.blue(), 255),
-                        bottom_color: Color::from_rgba8(bot.red(), bot.green(), bot.blue(), 255),
-                    };
-                }
+        if let (Some(top), Some(bot), Some(left), Some(right)) = (p_top, p_bot, p_left, p_right)
+            && top.alpha() > 200
+            && bot.alpha() > 200
+            && left.alpha() > 200
+            && right.alpha() > 200
+        {
+            let diff_lr = (left.red() as i32 - right.red() as i32).abs()
+                + (left.green() as i32 - right.green() as i32).abs()
+                + (left.blue() as i32 - right.blue() as i32).abs();
+            if diff_lr < 30 {
+                return IconProfile::UniformColoredCircle {
+                    top_color: Color::from_rgba8(top.red(), top.green(), top.blue(), 255),
+                    bottom_color: Color::from_rgba8(bot.red(), bot.green(), bot.blue(), 255),
+                };
             }
         }
     }

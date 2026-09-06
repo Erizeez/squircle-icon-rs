@@ -82,10 +82,11 @@ fn resolve_icon_uncached(icon_name: &str) -> Option<PathBuf> {
 
     // Determine candidate names (e.g. "com.usebottles.bottles" -> ["com.usebottles.bottles", "bottles"])
     let mut candidate_names = vec![icon_name.to_string()];
-    if let Some(short_stem) = icon_name.rsplit('.').next() {
-        if short_stem != icon_name && !short_stem.is_empty() {
-            candidate_names.push(short_stem.to_string());
-        }
+    if let Some(short_stem) = icon_name.rsplit('.').next()
+        && short_stem != icon_name
+        && !short_stem.is_empty()
+    {
+        candidate_names.push(short_stem.to_string());
     }
 
     let roots = icon_search_roots();
