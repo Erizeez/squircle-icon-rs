@@ -30,6 +30,12 @@ pub fn icon_search_roots() -> Vec<PathBuf> {
         roots.push(PathBuf::from("/usr/share/icons"));
     }
 
+    // Flatpak exports roots (both user and system)
+    if let Ok(home) = env::var("HOME") {
+        roots.push(PathBuf::from(home).join(".local/share/flatpak/exports/share/icons"));
+    }
+    roots.push(PathBuf::from("/var/lib/flatpak/exports/share/icons"));
+
     // Pixmaps fallback roots
     roots.push(PathBuf::from("/usr/share/pixmaps"));
     if let Ok(home) = env::var("HOME") {
@@ -37,7 +43,13 @@ pub fn icon_search_roots() -> Vec<PathBuf> {
     }
 
     roots.retain(|p| p.is_dir());
-    roots
+    let mut deduped = Vec::new();
+    for root in roots {
+        if !deduped.contains(&root) {
+            deduped.push(root);
+        }
+    }
+    deduped
 }
 
 /// Resolves an application icon name to a concrete on-disk SVG or raster asset path.
@@ -68,6 +80,14 @@ fn resolve_icon_uncached(icon_name: &str) -> Option<PathBuf> {
         return Some(direct.to_path_buf());
     }
 
+    // Determine candidate names (e.g. "com.usebottles.bottles" -> ["com.usebottles.bottles", "bottles"])
+    let mut candidate_names = vec![icon_name.to_string()];
+    if let Some(short_stem) = icon_name.rsplit('.').next() {
+        if short_stem != icon_name && !short_stem.is_empty() {
+            candidate_names.push(short_stem.to_string());
+        }
+    }
+
     let roots = icon_search_roots();
     let themes = ["hicolor", "Adwaita", "breeze", "gnome"];
     // Prefer scalable SVGs first, then descending raster resolutions (including @2 high-DPI)
@@ -76,39 +96,90 @@ fn resolve_icon_uncached(icon_name: &str) -> Option<PathBuf> {
         "128x128@2", "128x128", "96x96", "64x64", "48x48", "32x32",
     ];
     let categories = ["apps", "mimetypes", "categories", "status", "places"];
+    let extensions = ["svg", "png", "webp", "xpm"];
 
+    let has_graphic_ext = matches!(
+        direct.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(),
+        Some("svg" | "png" | "webp" | "xpm" | "jpg" | "jpeg" | "ico")
+    );
+
+    // 2. Search pixmaps roots
     for root in &roots {
         if root.ends_with("pixmaps") {
-            let candidate = root.join(icon_name);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-            for ext in ["svg", "png", "webp", "xpm"] {
-                let candidate = root.join(format!("{icon_name}.{ext}"));
+            for name in &candidate_names {
+                let candidate = root.join(name);
                 if candidate.is_file() {
                     return Some(candidate);
                 }
+                if !has_graphic_ext {
+                    for ext in extensions {
+                        let candidate = root.join(format!("{name}.{ext}"));
+                        if candidate.is_file() {
+                            return Some(candidate);
+                        }
+                    }
+                }
             }
-            continue;
         }
+    }
 
+    // 3. Search standard theme trees
+    for name in &candidate_names {
         for theme in &themes {
-            let theme_root = root.join(theme);
-            if !theme_root.is_dir() {
+            for root in &roots {
+                if root.ends_with("pixmaps") {
+                    continue;
+                }
+                let theme_root = root.join(theme);
+                if !theme_root.is_dir() {
+                    continue;
+                }
+                for size in &sizes {
+                    for category in &categories {
+                        let dir = theme_root.join(size).join(category);
+                        let candidate = dir.join(name);
+                        if candidate.is_file() {
+                            return Some(candidate);
+                        }
+                        if !has_graphic_ext {
+                            for ext in extensions {
+                                let candidate = dir.join(format!("{name}.{ext}"));
+                                if candidate.is_file() {
+                                    return Some(candidate);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 4. Fallback: if a short name was searched (e.g. "bottles"), scan for reverse-DNS matches (e.g. "*.bottles.svg")
+    if !icon_name.contains('.') {
+        let suffix_dot = format!(".{icon_name}");
+        for root in &roots {
+            if root.ends_with("pixmaps") {
                 continue;
             }
-            for size in &sizes {
-                for category in &categories {
-                    let dir = theme_root.join(size).join(category);
-                    let candidate = dir.join(icon_name);
-                    if candidate.is_file() {
-                        return Some(candidate);
-                    }
-                    if direct.extension().is_none() {
-                        for ext in ["svg", "png", "webp"] {
-                            let candidate = dir.join(format!("{icon_name}.{ext}"));
-                            if candidate.is_file() {
-                                return Some(candidate);
+            for theme in &themes {
+                let theme_root = root.join(theme);
+                if !theme_root.is_dir() {
+                    continue;
+                }
+                for size in &sizes {
+                    for category in &categories {
+                        let dir = theme_root.join(size).join(category);
+                        if let Ok(entries) = std::fs::read_dir(&dir) {
+                            for entry in entries.flatten() {
+                                let file_name = entry.file_name();
+                                let name_str = file_name.to_string_lossy();
+                                for ext in extensions {
+                                    let target_suffix = format!("{suffix_dot}.{ext}");
+                                    if name_str.ends_with(&target_suffix) {
+                                        return Some(entry.path());
+                                    }
+                                }
                             }
                         }
                     }
@@ -137,5 +208,14 @@ mod tests {
             assert!(resolved.is_some());
             assert!(resolved.unwrap().to_str().unwrap().contains("moonlight"));
         }
+    }
+
+    #[test]
+    fn test_resolve_bottles() {
+        println!("icon_search_roots: {:?}", icon_search_roots());
+        let r1 = resolve_icon("bottles");
+        println!("resolve_icon('bottles') -> {:?}", r1);
+        let r2 = resolve_icon("com.usebottles.bottles");
+        println!("resolve_icon('com.usebottles.bottles') -> {:?}", r2);
     }
 }
