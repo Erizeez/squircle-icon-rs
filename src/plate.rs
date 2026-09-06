@@ -74,51 +74,142 @@ pub fn build_squircle_path(
     pb.finish()
 }
 
-/// Analyzes whether an icon's corners are transparent (floating cutout / circle).
-pub fn is_cutout_icon(pixmap: &Pixmap) -> bool {
+/// Detailed icon profile detected from spatial alpha distribution and color characteristics.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum IconProfile {
+    /// Icon fills the entire canvas with opaque corners (e.g. Alacritty, Firefox).
+    FullBleed,
+    /// Icon is an existing squircle card with transparent padding (e.g. Apifox, PeaZip, Antigravity).
+    /// Contains the scale factor and translation offsets needed to seamlessly bleed into the canvas.
+    PreFramedSquircle {
+        scale: f32,
+        offset_x: f32,
+        offset_y: f32,
+    },
+    /// Icon has a uniform dark/colored circular rim (e.g. Moonlight).
+    UniformColoredCircle {
+        top_color: Color,
+        bottom_color: Color,
+    },
+    /// Cutout glyph or multi-color badge (e.g. Chrome, CMake, Fcitx5).
+    FloatingCutout,
+}
+
+/// Detects the icon archetype from its alpha distribution and color symmetry.
+pub fn detect_icon_profile(pixmap: &Pixmap) -> IconProfile {
     let w = pixmap.width();
     let h = pixmap.height();
     if w < 8 || h < 8 {
-        return false;
+        return IconProfile::FullBleed;
     }
 
-    // Check corner regions (within 8% of width and height)
-    let sample_w = (w / 12).max(2);
-    let sample_h = (h / 12).max(2);
-
+    // 1. Fast corner check for full-bleed icons
+    let inset = (w / 16).max(1);
     let corners = [
-        (0..sample_w, 0..sample_h),                         // Top-Left
-        (w - sample_w..w, 0..sample_h),                     // Top-Right
-        (0..sample_w, h - sample_h..h),                     // Bottom-Left
-        (w - sample_w..w, h - sample_h..h),                 // Bottom-Right
+        (inset, inset),
+        (w - 1 - inset, inset),
+        (inset, h - 1 - inset),
+        (w - 1 - inset, h - 1 - inset),
     ];
+    let corners_opaque = corners
+        .iter()
+        .all(|&(x, y)| pixmap.pixel(x, y).map_or(false, |p| p.alpha() > 200));
+    if corners_opaque {
+        return IconProfile::FullBleed;
+    }
 
-    let mut transparent_corner_samples = 0;
-    let mut total_corner_samples = 0;
+    // 2. Scan bounding box and opaque pixel density
+    let mut min_x = w;
+    let mut max_x = 0;
+    let mut min_y = h;
+    let mut max_y = 0;
+    let mut opaque_count = 0;
 
-    for (xs, ys) in corners {
-        for y in ys {
-            for x in xs.clone() {
-                if let Some(pixel) = pixmap.pixel(x, y) {
-                    total_corner_samples += 1;
-                    if pixel.alpha() < 32 {
-                        transparent_corner_samples += 1;
-                    }
+    for y in 0..h {
+        for x in 0..w {
+            if let Some(p) = pixmap.pixel(x, y) {
+                if p.alpha() > 32 {
+                    opaque_count += 1;
+                    min_x = min_x.min(x);
+                    max_x = max_x.max(x);
+                    min_y = min_y.min(y);
+                    max_y = max_y.max(y);
                 }
             }
         }
     }
 
-    if total_corner_samples == 0 {
-        return false;
+    if max_x < min_x || max_y < min_y || opaque_count == 0 {
+        return IconProfile::FloatingCutout;
     }
 
-    // If more than 60% of the 4 outer corner samples are transparent, it's a cutout/circle
-    let ratio = transparent_corner_samples as f32 / total_corner_samples as f32;
-    ratio >= 0.60
+    let box_w = max_x - min_x + 1;
+    let box_h = max_y - min_y + 1;
+    let box_area = (box_w * box_h) as f32;
+    let box_fill_ratio = opaque_count as f32 / box_area;
+    let w_ratio = box_w as f32 / w as f32;
+    let h_ratio = box_h as f32 / h as f32;
+
+    // 3. Full-bleed if bounding box covers the canvas (e.g. WeChat, Feishu)
+    if w_ratio >= 0.94 && h_ratio >= 0.94 && box_fill_ratio >= 0.88 {
+        return IconProfile::FullBleed;
+    }
+
+    // 4. PreFramedSquircle detection (inner card with transparent padding):
+    // macOS Big Sur standard: 824px in 1024px canvas (~80.5% width/height).
+    // The continuous squircle fills ~91-96% of its bounding box.
+    if w_ratio >= 0.70 && w_ratio <= 0.92 && h_ratio >= 0.70 && h_ratio <= 0.92
+        && (w_ratio - h_ratio).abs() < 0.10 && box_fill_ratio >= 0.88
+    {
+        let sx = w as f32 / box_w as f32;
+        let sy = h as f32 / box_h as f32;
+        let s = sx.min(sy) * 1.02; // slight bleed margin to ensure seamless edge
+        let cx = (min_x + max_x) as f32 / 2.0;
+        let cy = (min_y + max_y) as f32 / 2.0;
+        let offset_x = (w as f32 / 2.0) - cx * s;
+        let offset_y = (h as f32 / 2.0) - cy * s;
+        return IconProfile::PreFramedSquircle {
+            scale: s,
+            offset_x,
+            offset_y,
+        };
+    }
+
+    // 4. Circle with uniform rim detection (e.g. Moonlight):
+    // Circle fills pi/4 = ~78.5% of its bounding box.
+    if box_fill_ratio >= 0.73 && box_fill_ratio <= 0.84 && w_ratio >= 0.85 && h_ratio >= 0.85 {
+        let mid_x = (min_x + max_x) / 2;
+        let mid_y = (min_y + max_y) / 2;
+        let p_top = pixmap.pixel(mid_x, (min_y + 4).min(max_y));
+        let p_bot = pixmap.pixel(mid_x, (max_y.saturating_sub(4)).max(min_y));
+        let p_left = pixmap.pixel((min_x + 4).min(max_x), mid_y);
+        let p_right = pixmap.pixel((max_x.saturating_sub(4)).max(min_x), mid_y);
+
+        if let (Some(top), Some(bot), Some(left), Some(right)) = (p_top, p_bot, p_left, p_right) {
+            if top.alpha() > 200 && bot.alpha() > 200 && left.alpha() > 200 && right.alpha() > 200 {
+                let diff_lr = (left.red() as i32 - right.red() as i32).abs()
+                    + (left.green() as i32 - right.green() as i32).abs()
+                    + (left.blue() as i32 - right.blue() as i32).abs();
+                if diff_lr < 30 {
+                    return IconProfile::UniformColoredCircle {
+                        top_color: Color::from_rgba8(top.red(), top.green(), top.blue(), 255),
+                        bottom_color: Color::from_rgba8(bot.red(), bot.green(), bot.blue(), 255),
+                    };
+                }
+            }
+        }
+    }
+
+    // 5. Default: floating cutout / multi-color badge / irregular glyph
+    IconProfile::FloatingCutout
 }
 
-/// Applies macOS-style continuous curvature squircle masking and plate framing.
+/// Analyzes whether an icon's corners are transparent (floating cutout / circle).
+pub fn is_cutout_icon(pixmap: &Pixmap) -> bool {
+    !matches!(detect_icon_profile(pixmap), IconProfile::FullBleed)
+}
+
+/// Applies macOS-style continuous curvature squircle masking and adaptive plate framing.
 pub fn apply_squircle_plate(source: &Pixmap, options: PlateOptions) -> Pixmap {
     let width = source.width();
     let height = source.height();
@@ -145,36 +236,89 @@ pub fn apply_squircle_plate(source: &Pixmap, options: PlateOptions) -> Pixmap {
         None => return source.clone(),
     };
 
-    // 1. Render Apple squircle background plate (pure white with subtle depth gradient)
-    let (top_color, bottom_color, border_color) = match options.theme {
-        PlateTheme::Light => (
-            Color::WHITE,
-            Color::from_rgba8(242, 242, 247, 255),
-            Color::from_rgba8(0, 0, 0, 20),
-        ),
-        PlateTheme::Dark => (
-            Color::from_rgba8(48, 48, 51, 255),
-            Color::from_rgba8(28, 28, 30, 255),
-            Color::from_rgba8(255, 255, 255, 30),
-        ),
+    // 1. Prepare continuous curvature squircle clipping mask
+    let mut mask = match Mask::new(width, height) {
+        Some(m) => m,
+        None => return output,
+    };
+    mask.fill_path(&path, tiny_skia::FillRule::Winding, true, Transform::identity());
+
+    // 2. Identify icon archetype
+    let profile = match options.strategy {
+        MattingStrategy::AlwaysPlate => IconProfile::FloatingCutout,
+        MattingStrategy::SquircleClipOnly => IconProfile::FullBleed,
+        MattingStrategy::Auto => detect_icon_profile(source),
+        MattingStrategy::Raw => unreachable!(),
     };
 
-    let mut plate_paint = Paint::default();
-    if let Some(shader) = LinearGradient::new(
-        tiny_skia::Point::from_xy(w / 2.0, 0.0),
-        tiny_skia::Point::from_xy(w / 2.0, h),
-        vec![
-            GradientStop::new(0.0, top_color),
-            GradientStop::new(1.0, bottom_color),
-        ],
-        SpreadMode::Pad,
-        Transform::identity(),
-    ) {
-        plate_paint.shader = shader;
-    } else {
-        plate_paint.set_color(top_color);
+    // 3. Render according to archetype
+    let border_color = match options.theme {
+        PlateTheme::Light => Color::from_rgba8(0, 0, 0, 20),
+        PlateTheme::Dark => Color::from_rgba8(255, 255, 255, 30),
+    };
+
+    match profile {
+        IconProfile::FullBleed => {
+            // Full-bleed: render at scale 1.0 covering the tile, clipped to squircle
+            output.draw_pixmap(0, 0, source.as_ref(), &PixmapPaint::default(), Transform::identity(), Some(&mask));
+        }
+        IconProfile::PreFramedSquircle { scale, offset_x, offset_y } => {
+            // Adaptive Fusion (Apifox, PeaZip, Antigravity):
+            // Scale and center the existing squircle card to fill the canvas seamlessly
+            let transform = Transform::from_scale(scale, scale).post_translate(offset_x, offset_y);
+            output.draw_pixmap(0, 0, source.as_ref(), &PixmapPaint::default(), transform, Some(&mask));
+        }
+        IconProfile::UniformColoredCircle { top_color, bottom_color } => {
+            // Circular icon with uniform rim (e.g. Moonlight):
+            // Render adaptive plate matching the rim tone
+            let mut plate_paint = Paint::default();
+            if let Some(shader) = LinearGradient::new(
+                tiny_skia::Point::from_xy(w / 2.0, 0.0),
+                tiny_skia::Point::from_xy(w / 2.0, h),
+                vec![GradientStop::new(0.0, top_color), GradientStop::new(1.0, bottom_color)],
+                SpreadMode::Pad,
+                Transform::identity(),
+            ) {
+                plate_paint.shader = shader;
+            } else {
+                plate_paint.set_color(top_color);
+            }
+            output.fill_path(&path, &plate_paint, tiny_skia::FillRule::Winding, Transform::identity(), None);
+
+            let scale = options.glyph_scale.clamp(0.5, 0.95);
+            let dx = (w - (w * scale)) / 2.0;
+            let dy = (h - (h * scale)) / 2.0;
+            let transform = Transform::from_scale(scale, scale).post_translate(dx, dy);
+            output.draw_pixmap(0, 0, source.as_ref(), &PixmapPaint::default(), transform, Some(&mask));
+        }
+        IconProfile::FloatingCutout => {
+            // Floating glyph / cutout (Chrome, CMake, Fcitx5):
+            // Render Apple-style subtle gradient plate and center glyph
+            let (top_color, bottom_color) = match options.theme {
+                PlateTheme::Light => (Color::WHITE, Color::from_rgba8(242, 242, 247, 255)),
+                PlateTheme::Dark => (Color::from_rgba8(48, 48, 51, 255), Color::from_rgba8(28, 28, 30, 255)),
+            };
+            let mut plate_paint = Paint::default();
+            if let Some(shader) = LinearGradient::new(
+                tiny_skia::Point::from_xy(w / 2.0, 0.0),
+                tiny_skia::Point::from_xy(w / 2.0, h),
+                vec![GradientStop::new(0.0, top_color), GradientStop::new(1.0, bottom_color)],
+                SpreadMode::Pad,
+                Transform::identity(),
+            ) {
+                plate_paint.shader = shader;
+            } else {
+                plate_paint.set_color(top_color);
+            }
+            output.fill_path(&path, &plate_paint, tiny_skia::FillRule::Winding, Transform::identity(), None);
+
+            let scale = options.glyph_scale.clamp(0.5, 0.95);
+            let dx = (w - (w * scale)) / 2.0;
+            let dy = (h - (h * scale)) / 2.0;
+            let transform = Transform::from_scale(scale, scale).post_translate(dx, dy);
+            output.draw_pixmap(0, 0, source.as_ref(), &PixmapPaint::default(), transform, Some(&mask));
+        }
     }
-    output.fill_path(&path, &plate_paint, tiny_skia::FillRule::Winding, Transform::identity(), None);
 
     // Subtle hairline inner border
     let border_width = (w / 128.0).max(1.0);
@@ -185,43 +329,6 @@ pub fn apply_squircle_plate(source: &Pixmap, options: PlateOptions) -> Pixmap {
         ..Default::default()
     };
     output.stroke_path(&path, &stroke_paint, &stroke, Transform::identity(), None);
-
-    // 2. Prepare continuous curvature squircle clipping mask
-    let mut mask = match Mask::new(width, height) {
-        Some(m) => m,
-        None => return output,
-    };
-    mask.fill_path(&path, tiny_skia::FillRule::Winding, true, Transform::identity());
-
-    // 3. Composite source icon onto plate
-    let is_cutout = match options.strategy {
-        MattingStrategy::AlwaysPlate => true,
-        MattingStrategy::SquircleClipOnly => false,
-        MattingStrategy::Auto => is_cutout_icon(source),
-        MattingStrategy::Raw => unreachable!(),
-    };
-
-    let transform = if is_cutout {
-        // Floating glyph / cutout (Moonlight, CMake, mpv, System Settings):
-        // Scale to glyph_scale (~0.80) and center on plate
-        let scale = options.glyph_scale.clamp(0.5, 0.95);
-        let dx = (w - (w * scale)) / 2.0;
-        let dy = (h - (h * scale)) / 2.0;
-        Transform::from_scale(scale, scale).post_translate(dx, dy)
-    } else {
-        // Full-bleed icon with background fill (Alacritty, Chrome, Firefox):
-        // Render at 1.0 scale covering plate, clipped to squircle
-        Transform::identity()
-    };
-
-    output.draw_pixmap(
-        0,
-        0,
-        source.as_ref(),
-        &PixmapPaint::default(),
-        transform,
-        Some(&mask),
-    );
 
     output
 }
@@ -280,13 +387,58 @@ mod tests {
     }
 
     #[test]
-    fn test_cmake_cutout_if_exists() {
-        let p = std::path::Path::new("/usr/share/icons/hicolor/128x128/apps/CMakeSetup.png");
-        if p.exists() {
+    fn test_profile_detection_synthetic() {
+        // 1. Full bleed (completely opaque)
+        let mut full_bleed = Pixmap::new(100, 100).unwrap();
+        full_bleed.fill(Color::from_rgba8(20, 50, 100, 255));
+        assert_eq!(detect_icon_profile(&full_bleed), IconProfile::FullBleed);
+
+        // 2. Pre-framed squircle card (80x80 card in 100x100 canvas, squircle shape)
+        let mut squircle_card = Pixmap::new(100, 100).unwrap();
+        let path = build_squircle_path(80.0, 80.0, 18.0, squircle_rs::APPLE_CORNER_SMOOTHING).unwrap();
+        let mut paint = Paint::default();
+        paint.set_color_rgba8(255, 100, 50, 255);
+        squircle_card.fill_path(&path, &paint, tiny_skia::FillRule::Winding, Transform::from_translate(10.0, 10.0), None);
+        assert!(matches!(detect_icon_profile(&squircle_card), IconProfile::PreFramedSquircle { .. }));
+
+        // 3. Render squircle plate on pre-framed card
+        let rendered = apply_squircle_plate(&squircle_card, PlateOptions::default());
+        assert_eq!(rendered.width(), 100);
+        assert_eq!(rendered.height(), 100);
+    }
+
+    #[test]
+    fn test_profile_detection_system_icons() {
+        let targets = [
+            ("Apifox", "/var/lib/flatpak/appstream/flathub/x86_64/70da372709099bbdd422326b03f09cdf46afe365999abb4aac127a5b9bc7f0ad/icons/128x128/com.apifox.Apifox.png", "squircle"),
+            ("PeaZip", "/var/lib/flatpak/appstream/flathub/x86_64/70da372709099bbdd422326b03f09cdf46afe365999abb4aac127a5b9bc7f0ad/icons/128x128/io.github.peazip.PeaZip.png", "squircle"),
+            ("Antigravity", "/home/eriz/.local/share/icons/hicolor/512x512/apps/antigravity.png", "squircle"),
+            ("WeChat", "/usr/share/icons/hicolor/128x128/apps/wechat.png", "full_bleed"),
+            ("CMake", "/usr/share/icons/hicolor/128x128/apps/CMakeSetup.png", "cutout"),
+        ];
+
+        for (name, path, expected) in targets {
+            let p = std::path::Path::new(path);
+            if !p.exists() {
+                continue;
+            }
             let pix = crate::raster::rasterize_file(p, 128, 128).unwrap();
-            let cutout = is_cutout_icon(&pix);
-            println!("CMake is_cutout_icon: {cutout}");
-            assert!(cutout, "CMake icon should be recognized as cutout");
+            let profile = detect_icon_profile(&pix);
+            match expected {
+                "squircle" => assert!(
+                    matches!(profile, IconProfile::PreFramedSquircle { .. }),
+                    "{name} expected PreFramedSquircle, got {:?}", profile
+                ),
+                "full_bleed" => assert!(
+                    matches!(profile, IconProfile::FullBleed),
+                    "{name} expected FullBleed, got {:?}", profile
+                ),
+                "cutout" => assert!(
+                    matches!(profile, IconProfile::FloatingCutout),
+                    "{name} expected FloatingCutout, got {:?}", profile
+                ),
+                _ => {}
+            }
         }
     }
 }

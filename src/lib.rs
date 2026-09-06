@@ -16,7 +16,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 pub use lookup::{icon_search_roots, resolve_icon};
-pub use plate::{apply_squircle_plate, is_cutout_icon, MattingStrategy, PlateOptions, PlateTheme};
+pub use plate::{
+    apply_squircle_plate, detect_icon_profile, is_cutout_icon, IconProfile, MattingStrategy,
+    PlateOptions, PlateTheme,
+};
 pub use raster::{rasterize_file, rasterize_image_data, rasterize_svg_data, RasterError};
 pub use tiny_skia::Pixmap;
 
