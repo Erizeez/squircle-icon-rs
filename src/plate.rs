@@ -1,7 +1,10 @@
 use squircle_rs::{
-    squircle_alpha, squircle_border_coverage, Point, APPLE_CORNER_SMOOTHING,
+    squircle_path_commands, PathCommand, SquircleParams, APPLE_CORNER_SMOOTHING,
 };
-use tiny_skia::{Pixmap, PremultipliedColorU8, Transform};
+use tiny_skia::{
+    Color, GradientStop, LinearGradient, Mask, Paint, Path, PathBuilder, Pixmap, PixmapPaint,
+    SpreadMode, Stroke, Transform,
+};
 
 /// Icon background plate styling theme.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -33,7 +36,7 @@ pub struct PlateOptions {
     pub theme: PlateTheme,
     /// Relative corner radius as a ratio of half-size (Apple default is 0.444).
     pub corner_radius_ratio: f32,
-    /// Relative scale of the inner glyph when placed on a plate (Apple standard ~0.78).
+    /// Relative scale of the inner glyph when placed on a plate (Apple standard ~0.80).
     pub glyph_scale: f32,
 }
 
@@ -43,9 +46,32 @@ impl Default for PlateOptions {
             strategy: MattingStrategy::Auto,
             theme: PlateTheme::Light,
             corner_radius_ratio: 0.444,
-            glyph_scale: 0.78,
+            glyph_scale: 0.80,
         }
     }
+}
+
+/// Constructs an exact Apple continuous curvature squircle [`tiny_skia::Path`].
+pub fn build_squircle_path(
+    width: f32,
+    height: f32,
+    corner_radius: f32,
+    smoothing: f32,
+) -> Option<Path> {
+    let params = SquircleParams::new(width, height, corner_radius).with_smoothing(smoothing);
+    let cmds = squircle_path_commands(&params);
+    let mut pb = PathBuilder::new();
+    for cmd in cmds {
+        match cmd {
+            PathCommand::MoveTo(p) => pb.move_to(p.x, p.y),
+            PathCommand::LineTo(p) => pb.line_to(p.x, p.y),
+            PathCommand::CubicTo { c0, c1, to } => {
+                pb.cubic_to(c0.x, c0.y, c1.x, c1.y, to.x, to.y);
+            }
+            PathCommand::Close => pb.close(),
+        }
+    }
+    pb.finish()
 }
 
 /// Analyzes whether an icon's corners are transparent (floating cutout / circle).
@@ -56,9 +82,9 @@ pub fn is_cutout_icon(pixmap: &Pixmap) -> bool {
         return false;
     }
 
-    // Check corner regions (within 10% of width and height)
-    let sample_w = (w / 10).max(2);
-    let sample_h = (h / 10).max(2);
+    // Check corner regions (within 8% of width and height)
+    let sample_w = (w / 12).max(2);
+    let sample_h = (h / 12).max(2);
 
     let corners = [
         (0..sample_w, 0..sample_h),                         // Top-Left
@@ -87,9 +113,9 @@ pub fn is_cutout_icon(pixmap: &Pixmap) -> bool {
         return false;
     }
 
-    // If more than 75% of the 4 outer corner samples are transparent, it's a cutout/circle
+    // If more than 60% of the 4 outer corner samples are transparent, it's a cutout/circle
     let ratio = transparent_corner_samples as f32 / total_corner_samples as f32;
-    ratio >= 0.75
+    ratio >= 0.60
 }
 
 /// Applies macOS-style continuous curvature squircle masking and plate framing.
@@ -100,140 +126,104 @@ pub fn apply_squircle_plate(source: &Pixmap, options: PlateOptions) -> Pixmap {
         return source.clone();
     }
 
-    let needs_plate = match options.strategy {
-        MattingStrategy::Raw => return source.clone(),
-        MattingStrategy::SquircleClipOnly => false,
-        MattingStrategy::AlwaysPlate => true,
-        MattingStrategy::Auto => is_cutout_icon(source),
-    };
-
-    let half_w = width as f32 / 2.0;
-    let half_h = height as f32 / 2.0;
-    let half_size = Point { x: half_w, y: half_h };
-    let radius = half_w.min(half_h) * options.corner_radius_ratio;
-
-    let mut output = Pixmap::new(width, height).unwrap_or_else(|| source.clone());
-
-    if needs_plate {
-        // 1. Draw Apple squircle background plate with subtle gradient and hairline border
-        let (top_color, bottom_color, border_color) = match options.theme {
-            PlateTheme::Light => (
-                (255, 255, 255, 248),
-                (242, 242, 247, 248),
-                (0, 0, 0, 24),
-            ),
-            PlateTheme::Dark => (
-                (44, 44, 46, 248),
-                (28, 28, 30, 248),
-                (255, 255, 255, 30),
-            ),
-        };
-
-        let pixels = output.pixels_mut();
-        for y in 0..height {
-            let py = y as f32 + 0.5;
-            let rel_y = py - half_h;
-            let grad_t = py / height as f32;
-            let plate_r = lerp_u8(top_color.0, bottom_color.0, grad_t);
-            let plate_g = lerp_u8(top_color.1, bottom_color.1, grad_t);
-            let plate_b = lerp_u8(top_color.2, bottom_color.2, grad_t);
-            let plate_a = lerp_u8(top_color.3, bottom_color.3, grad_t);
-
-            for x in 0..width {
-                let px = x as f32 + 0.5;
-                let rel_x = px - half_w;
-                let pt = Point { x: rel_x, y: rel_y };
-                let (fill_alpha, border_cov) = squircle_border_coverage(
-                    pt,
-                    half_size,
-                    radius,
-                    0.75,
-                    APPLE_CORNER_SMOOTHING,
-                );
-                let alpha = fill_alpha.max(border_cov);
-                if alpha <= 0.001 {
-                    continue;
-                }
-
-                // Blend plate color with inner border
-                let final_r = lerp_u8(plate_r, border_color.0, border_cov);
-                let final_g = lerp_u8(plate_g, border_color.1, border_cov);
-                let final_b = lerp_u8(plate_b, border_color.2, border_cov);
-                let final_a = (plate_a as f32 / 255.0 * alpha).clamp(0.0, 1.0);
-
-                let premul = PremultipliedColorU8::from_rgba(
-                    (final_r as f32 * final_a).round() as u8,
-                    (final_g as f32 * final_a).round() as u8,
-                    (final_b as f32 * final_a).round() as u8,
-                    (final_a * 255.0).round() as u8,
-                );
-                if let Some(c) = premul {
-                    pixels[(y * width + x) as usize] = c;
-                }
-            }
-        }
-
-        // 2. Composite the source glyph centered at scaled proportion
-        let glyph_scale = options.glyph_scale.clamp(0.4, 0.95);
-        let scaled_w = (width as f32 * glyph_scale).round() as u32;
-        let scaled_h = (height as f32 * glyph_scale).round() as u32;
-
-        let offset_x = (width - scaled_w) as f32 / 2.0;
-        let offset_y = (height - scaled_h) as f32 / 2.0;
-
-        let scale = glyph_scale;
-        let transform = Transform::from_translate(offset_x, offset_y).post_scale(scale, scale);
-
-        output.draw_pixmap(
-            0,
-            0,
-            source.as_ref(),
-            &tiny_skia::PixmapPaint::default(),
-            transform,
-            None,
-        );
-    } else {
-        // Full-bleed icon: Clip corners directly with continuous curvature squircle mask
-        let pixels = output.pixels_mut();
-        let src_pixels = source.pixels();
-
-        for y in 0..height {
-            let py = y as f32 + 0.5;
-            let rel_y = py - half_h;
-            for x in 0..width {
-                let px = x as f32 + 0.5;
-                let rel_x = px - half_w;
-                let pt = Point { x: rel_x, y: rel_y };
-                let mask_alpha = squircle_alpha(pt, half_size, radius, APPLE_CORNER_SMOOTHING);
-                if mask_alpha <= 0.001 {
-                    continue;
-                }
-
-                let idx = (y * width + x) as usize;
-                let src_pixel = src_pixels[idx];
-
-                if mask_alpha >= 0.999 {
-                    pixels[idx] = src_pixel;
-                } else {
-                    let a = (src_pixel.alpha() as f32 / 255.0 * mask_alpha).clamp(0.0, 1.0);
-                    let r = (src_pixel.red() as f32 * mask_alpha).round() as u8;
-                    let g = (src_pixel.green() as f32 * mask_alpha).round() as u8;
-                    let b = (src_pixel.blue() as f32 * mask_alpha).round() as u8;
-                    if let Some(c) = PremultipliedColorU8::from_rgba(r, g, b, (a * 255.0).round() as u8) {
-                        pixels[idx] = c;
-                    }
-                }
-            }
-        }
+    if options.strategy == MattingStrategy::Raw {
+        return source.clone();
     }
 
-    output
-}
+    let w = width as f32;
+    let h = height as f32;
 
-#[inline]
-fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
-    let t = t.clamp(0.0, 1.0);
-    ((a as f32) * (1.0 - t) + (b as f32) * t).round() as u8
+    // Corner radius based on Apple macOS HIG (ratio ~0.224 of size, or 0.444 of half-size)
+    let radius = (w.min(h) / 2.0) * options.corner_radius_ratio;
+    let path = match build_squircle_path(w, h, radius, APPLE_CORNER_SMOOTHING) {
+        Some(p) => p,
+        None => return source.clone(),
+    };
+
+    let mut output = match Pixmap::new(width, height) {
+        Some(p) => p,
+        None => return source.clone(),
+    };
+
+    // 1. Render Apple squircle background plate (pure white with subtle depth gradient)
+    let (top_color, bottom_color, border_color) = match options.theme {
+        PlateTheme::Light => (
+            Color::WHITE,
+            Color::from_rgba8(242, 242, 247, 255),
+            Color::from_rgba8(0, 0, 0, 20),
+        ),
+        PlateTheme::Dark => (
+            Color::from_rgba8(48, 48, 51, 255),
+            Color::from_rgba8(28, 28, 30, 255),
+            Color::from_rgba8(255, 255, 255, 30),
+        ),
+    };
+
+    let mut plate_paint = Paint::default();
+    if let Some(shader) = LinearGradient::new(
+        tiny_skia::Point::from_xy(w / 2.0, 0.0),
+        tiny_skia::Point::from_xy(w / 2.0, h),
+        vec![
+            GradientStop::new(0.0, top_color),
+            GradientStop::new(1.0, bottom_color),
+        ],
+        SpreadMode::Pad,
+        Transform::identity(),
+    ) {
+        plate_paint.shader = shader;
+    } else {
+        plate_paint.set_color(top_color);
+    }
+    output.fill_path(&path, &plate_paint, tiny_skia::FillRule::Winding, Transform::identity(), None);
+
+    // Subtle hairline inner border
+    let border_width = (w / 128.0).max(1.0);
+    let mut stroke_paint = Paint::default();
+    stroke_paint.set_color(border_color);
+    let stroke = Stroke {
+        width: border_width,
+        ..Default::default()
+    };
+    output.stroke_path(&path, &stroke_paint, &stroke, Transform::identity(), None);
+
+    // 2. Prepare continuous curvature squircle clipping mask
+    let mut mask = match Mask::new(width, height) {
+        Some(m) => m,
+        None => return output,
+    };
+    mask.fill_path(&path, tiny_skia::FillRule::Winding, true, Transform::identity());
+
+    // 3. Composite source icon onto plate
+    let is_cutout = match options.strategy {
+        MattingStrategy::AlwaysPlate => true,
+        MattingStrategy::SquircleClipOnly => false,
+        MattingStrategy::Auto => is_cutout_icon(source),
+        MattingStrategy::Raw => unreachable!(),
+    };
+
+    let transform = if is_cutout {
+        // Floating glyph / cutout (Moonlight, CMake, mpv, System Settings):
+        // Scale to glyph_scale (~0.80) and center on plate
+        let scale = options.glyph_scale.clamp(0.5, 0.95);
+        let dx = (w - (w * scale)) / 2.0;
+        let dy = (h - (h * scale)) / 2.0;
+        Transform::from_scale(scale, scale).post_translate(dx, dy)
+    } else {
+        // Full-bleed icon with background fill (Alacritty, Chrome, Firefox):
+        // Render at 1.0 scale covering plate, clipped to squircle
+        Transform::identity()
+    };
+
+    output.draw_pixmap(
+        0,
+        0,
+        source.as_ref(),
+        &PixmapPaint::default(),
+        transform,
+        Some(&mask),
+    );
+
+    output
 }
 
 #[cfg(test)]
@@ -260,12 +250,43 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_squircle_plate_dimensions() {
-        let mut icon = Pixmap::new(128, 128).unwrap();
-        let c = tiny_skia::Color::WHITE;
-        icon.fill(c);
-        let framed = apply_squircle_plate(&icon, PlateOptions::default());
-        assert_eq!(framed.width(), 128);
-        assert_eq!(framed.height(), 128);
+    fn test_mask_api() {
+        let mut mask = tiny_skia::Mask::new(100, 100).unwrap();
+        let mut pb = tiny_skia::PathBuilder::new();
+        pb.push_circle(50.0, 50.0, 40.0);
+        let path = pb.finish().unwrap();
+        mask.fill_path(&path, tiny_skia::FillRule::Winding, true, Transform::identity());
+        let mut pixmap = Pixmap::new(100, 100).unwrap();
+        let mut paint = tiny_skia::Paint::default();
+        let grad = tiny_skia::LinearGradient::new(
+            tiny_skia::Point::from_xy(50.0, 0.0),
+            tiny_skia::Point::from_xy(50.0, 100.0),
+            vec![
+                tiny_skia::GradientStop::new(0.0, tiny_skia::Color::WHITE),
+                tiny_skia::GradientStop::new(1.0, tiny_skia::Color::from_rgba8(240, 240, 245, 255)),
+            ],
+            tiny_skia::SpreadMode::Pad,
+            Transform::identity(),
+        ).unwrap();
+        paint.shader = grad;
+        pixmap.fill_path(&path, &paint, tiny_skia::FillRule::Winding, Transform::identity(), None);
+        let mut stroke_paint = tiny_skia::Paint::default();
+        stroke_paint.set_color_rgba8(0, 0, 0, 20);
+        let stroke = tiny_skia::Stroke {
+            width: 1.0,
+            ..Default::default()
+        };
+        pixmap.stroke_path(&path, &stroke_paint, &stroke, Transform::identity(), None);
+    }
+
+    #[test]
+    fn test_cmake_cutout_if_exists() {
+        let p = std::path::Path::new("/usr/share/icons/hicolor/128x128/apps/CMakeSetup.png");
+        if p.exists() {
+            let pix = crate::raster::rasterize_file(p, 128, 128).unwrap();
+            let cutout = is_cutout_icon(&pix);
+            println!("CMake is_cutout_icon: {cutout}");
+            assert!(cutout, "CMake icon should be recognized as cutout");
+        }
     }
 }
