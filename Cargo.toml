@@ -1,0 +1,15 @@
+[package]
+name = "squircle-icon-rs"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Apple macOS HIG-compliant application icon lookup, squircle clipping, intelligent matting, and multi-format rasterizer"
+repository = "https://github.com/Erizeez/squircle-icon-rs"
+readme = "README.md"
+
+[dependencies]
+squircle-rs = { path = "../squircle-rs", version = "0.1.0" }
+tiny-skia = "0.11"
+resvg = "0.45"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+png = "0.17"
