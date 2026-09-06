@@ -145,10 +145,10 @@ impl AppIconEngine {
             theme: options.theme as u8,
         };
 
-        if let Ok(guard) = self.cache.lock() {
-            if let Some(entry) = guard.get(&key) {
-                return Some(entry.bitmap.clone());
-            }
+        if let Ok(guard) = self.cache.lock()
+            && let Some(entry) = guard.get(&key)
+        {
+            return Some(entry.bitmap.clone());
         }
 
         let path = if Path::new(name_or_path).is_file() {
@@ -188,17 +188,17 @@ impl AppIconEngine {
             theme: options.theme as u8,
         };
 
-        if let Ok(guard) = self.cache.lock() {
-            if let Some(entry) = guard.get(&key) {
-                return entry.svg_markup.clone();
-            }
+        if let Ok(guard) = self.cache.lock()
+            && let Some(entry) = guard.get(&key)
+        {
+            return entry.svg_markup.clone();
         }
 
         let bitmap = self.render(name_or_path, size, options)?;
-        if let Ok(guard) = self.cache.lock() {
-            if let Some(entry) = guard.get(&key) {
-                return entry.svg_markup.clone();
-            }
+        if let Ok(guard) = self.cache.lock()
+            && let Some(entry) = guard.get(&key)
+        {
+            return entry.svg_markup.clone();
         }
         bitmap.to_svg_markup()
     }

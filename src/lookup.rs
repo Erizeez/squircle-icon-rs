@@ -48,10 +48,10 @@ pub fn resolve_icon(icon_name: &str) -> Option<PathBuf> {
     }
 
     let cache = LOOKUP_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Ok(guard) = cache.lock() {
-        if let Some(cached) = guard.get(trimmed) {
-            return cached.clone();
-        }
+    if let Ok(guard) = cache.lock()
+        && let Some(cached) = guard.get(trimmed)
+    {
+        return cached.clone();
     }
 
     let resolved = resolve_icon_uncached(trimmed);
