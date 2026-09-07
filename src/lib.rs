@@ -305,6 +305,7 @@ mod tests {
             "antigravity",
             "hwloc",
             "com.apifox.Apifox",
+            "io.github.peazip.PeaZip",
             "bottles",
             "network-wired",
             "input-keyboard",

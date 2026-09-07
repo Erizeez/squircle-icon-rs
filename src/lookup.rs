@@ -30,11 +30,13 @@ pub fn icon_search_roots() -> Vec<PathBuf> {
         roots.push(PathBuf::from("/usr/share/icons"));
     }
 
-    // Flatpak exports roots (both user and system)
+    // Flatpak exports and appstream roots (both user and system)
     if let Ok(home) = env::var("HOME") {
-        roots.push(PathBuf::from(home).join(".local/share/flatpak/exports/share/icons"));
+        roots.push(PathBuf::from(&home).join(".local/share/flatpak/exports/share/icons"));
+        roots.push(PathBuf::from(home).join(".local/share/flatpak/appstream/flathub/x86_64/active/icons"));
     }
     roots.push(PathBuf::from("/var/lib/flatpak/exports/share/icons"));
+    roots.push(PathBuf::from("/var/lib/flatpak/appstream/flathub/x86_64/active/icons"));
 
     // Pixmaps fallback roots
     roots.push(PathBuf::from("/usr/share/pixmaps"));
@@ -178,6 +180,30 @@ fn resolve_icon_uncached(icon_name: &str) -> Option<PathBuf> {
     // 3. Search standard theme trees for exact candidate names
     if let Some(path) = search_theme_trees(&candidate_names) {
         return Some(path);
+    }
+
+    // Direct size roots (e.g. Flatpak appstream <root>/<size>/<name>.<ext>)
+    for root in &roots {
+        for size in &sizes {
+            let dir = root.join(size);
+            if !dir.is_dir() {
+                continue;
+            }
+            for name in &candidate_names {
+                let candidate = dir.join(name);
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+                if !has_graphic_ext {
+                    for ext in extensions {
+                        let candidate = dir.join(format!("{name}.{ext}"));
+                        if candidate.is_file() {
+                            return Some(candidate);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // 4. Fallback: if a short name was searched (e.g. "bottles"), scan for reverse-DNS matches (e.g. "*.bottles.svg")

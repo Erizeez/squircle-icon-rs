@@ -67,14 +67,24 @@ pub fn rasterize_image_data(
     if target_width == 0 || target_height == 0 {
         return Err(RasterError::InvalidSize);
     }
-    let dynamic_img = image::load_from_memory(image_data)?;
-    let resized = dynamic_img.resize(
+    let mut rgba_img = image::load_from_memory(image_data)?.into_rgba8();
+    // Pre-clean dirty transparent pixels (alpha <= 8) before Lanczos filtering
+    // to prevent dirty matte RGB from bleeding into adjacent visible pixels.
+    for pixel in rgba_img.pixels_mut() {
+        if pixel[3] <= 8 {
+            pixel[0] = 0;
+            pixel[1] = 0;
+            pixel[2] = 0;
+            pixel[3] = 0;
+        }
+    }
+    let resized = image::imageops::resize(
+        &rgba_img,
         target_width,
         target_height,
         image::imageops::FilterType::Lanczos3,
     );
-    let rgba = resized.to_rgba8();
-    let (w, h) = rgba.dimensions();
+    let (w, h) = resized.dimensions();
 
     let mut pixmap = Pixmap::new(target_width, target_height).ok_or(RasterError::AllocationFailed)?;
     let offset_x = ((target_width - w) / 2) as usize;
@@ -83,8 +93,11 @@ pub fn rasterize_image_data(
     let pixels = pixmap.pixels_mut();
     for y in 0..h as usize {
         for x in 0..w as usize {
-            let pixel = rgba.get_pixel(x as u32, y as u32);
-            if let Some(color) = PremultipliedColorU8::from_rgba(pixel[0], pixel[1], pixel[2], pixel[3]) {
+            let pixel = resized.get_pixel(x as u32, y as u32);
+            let a = if pixel[3] <= 8 { 0 } else { pixel[3] };
+            if a > 0
+                && let Some(color) = PremultipliedColorU8::from_rgba(pixel[0], pixel[1], pixel[2], a)
+            {
                 let target_idx = (offset_y + y) * target_width as usize + (offset_x + x);
                 if target_idx < pixels.len() {
                     pixels[target_idx] = color;

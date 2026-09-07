@@ -1,6 +1,6 @@
 [package]
 name = "squircle-icon-rs"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2024"
 license = "MIT"
 description = "Apple macOS HIG-compliant application icon lookup, squircle clipping, intelligent matting, and multi-format rasterizer"

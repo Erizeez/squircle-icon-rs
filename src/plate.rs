@@ -80,11 +80,14 @@ pub enum IconProfile {
     /// Icon fills the entire canvas with opaque corners (e.g. Alacritty, Firefox).
     FullBleed,
     /// Icon is an existing squircle card with transparent padding (e.g. Apifox, PeaZip, Antigravity).
-    /// Contains the scale factor and translation offsets needed to seamlessly bleed into the canvas.
+    /// Contains the scale factor and translation offsets needed to seamlessly bleed into the canvas,
+    /// plus the synchronized top and bottom background colors of the card.
     PreFramedSquircle {
         scale: f32,
         offset_x: f32,
         offset_y: f32,
+        top_color: Color,
+        bottom_color: Color,
     },
     /// Icon has a uniform dark/colored circular rim (e.g. Moonlight).
     UniformColoredCircle {
@@ -93,6 +96,32 @@ pub enum IconProfile {
     },
     /// Cutout glyph or multi-color badge (e.g. Chrome, CMake, Fcitx5).
     FloatingCutout,
+}
+
+fn average_sample_color(
+    c1: Option<tiny_skia::PremultipliedColorU8>,
+    c2: Option<tiny_skia::PremultipliedColorU8>,
+) -> Option<Color> {
+    match (c1, c2) {
+        (Some(a), Some(b)) => {
+            let r = (a.red() as u16 + b.red() as u16) / 2;
+            let g = (a.green() as u16 + b.green() as u16) / 2;
+            let bl = (a.blue() as u16 + b.blue() as u16) / 2;
+            let al = (a.alpha() as u16 + b.alpha() as u16) / 2;
+            if al < 64 {
+                None
+            } else {
+                Some(Color::from_rgba8(r as u8, g as u8, bl as u8, 255))
+            }
+        }
+        (Some(a), None) if a.alpha() >= 64 => {
+            Some(Color::from_rgba8(a.red(), a.green(), a.blue(), 255))
+        }
+        (None, Some(b)) if b.alpha() >= 64 => {
+            Some(Color::from_rgba8(b.red(), b.green(), b.blue(), 255))
+        }
+        _ => None,
+    }
 }
 
 /// Detects the icon archetype from its alpha distribution and color symmetry.
@@ -191,22 +220,43 @@ pub fn detect_icon_profile(pixmap: &Pixmap) -> IconProfile {
             && (right_span as f32 / box_h as f32) >= 0.60;
 
         if is_squircle_card {
+            // Margin bleed: expand by 1.20 so the card's original outer antialiased edge,
+            // baked-in drop shadows, and old corner curves are pushed completely outside the squircle mask boundary.
             let sx = w as f32 / box_w as f32;
             let sy = h as f32 / box_h as f32;
-            let s = sx.min(sy) * 1.02; // slight bleed margin to ensure seamless edge
+            let s = sx.min(sy) * 1.20;
             let cx = (min_x + max_x) as f32 / 2.0;
             let cy = (min_y + max_y) as f32 / 2.0;
             let offset_x = (w as f32 / 2.0) - cx * s;
             let offset_y = (h as f32 / 2.0) - cy * s;
+
+            // Synchronize background color: sample the card's background from its inner corner margins
+            let sample_inset_x = ((box_w as f32) * 0.16) as u32;
+            let sample_inset_y = ((box_h as f32) * 0.16) as u32;
+            let x_left = (min_x + sample_inset_x).min(max_x);
+            let x_right = max_x.saturating_sub(sample_inset_x).max(min_x);
+            let y_top = (min_y + sample_inset_y).min(max_y);
+            let y_bot = max_y.saturating_sub(sample_inset_y).max(min_y);
+
+            let pt_tl = pixmap.pixel(x_left, y_top);
+            let pt_tr = pixmap.pixel(x_right, y_top);
+            let pb_bl = pixmap.pixel(x_left, y_bot);
+            let pb_br = pixmap.pixel(x_right, y_bot);
+
+            let top_color = average_sample_color(pt_tl, pt_tr).unwrap_or(Color::WHITE);
+            let bottom_color = average_sample_color(pb_bl, pb_br).unwrap_or(top_color);
+
             return IconProfile::PreFramedSquircle {
                 scale: s,
                 offset_x,
                 offset_y,
+                top_color,
+                bottom_color,
             };
         }
     }
 
-    // 4. Circle with uniform rim detection (e.g. Moonlight):
+    // 4. Circle with uniform rim detection (e.g. Moonlight, Clash Verge):
     // Circle fills pi/4 = ~78.5% of its bounding box.
     if (0.73..=0.84).contains(&box_fill_ratio) && w_ratio >= 0.85 && h_ratio >= 0.85 {
         let mid_x = (min_x + max_x) / 2;
@@ -225,7 +275,7 @@ pub fn detect_icon_profile(pixmap: &Pixmap) -> IconProfile {
             let diff_lr = (left.red() as i32 - right.red() as i32).abs()
                 + (left.green() as i32 - right.green() as i32).abs()
                 + (left.blue() as i32 - right.blue() as i32).abs();
-            if diff_lr < 30 {
+            if diff_lr < 60 {
                 return IconProfile::UniformColoredCircle {
                     top_color: Color::from_rgba8(top.red(), top.green(), top.blue(), 255),
                     bottom_color: Color::from_rgba8(bot.red(), bot.green(), bot.blue(), 255),
@@ -301,9 +351,30 @@ pub fn apply_squircle_plate(source: &Pixmap, options: PlateOptions) -> Pixmap {
             // Full-bleed: render at scale 1.0 covering the tile, clipped to squircle
             output.draw_pixmap(0, 0, source.as_ref(), &pixmap_paint, Transform::identity(), Some(&mask));
         }
-        IconProfile::PreFramedSquircle { scale, offset_x, offset_y } => {
+        IconProfile::PreFramedSquircle {
+            scale,
+            offset_x,
+            offset_y,
+            top_color,
+            bottom_color,
+        } => {
             // Adaptive Fusion (Apifox, PeaZip, Antigravity):
-            // Scale and center the existing squircle card to fill the canvas seamlessly with Bicubic filtering
+            // 1. Fill plate with synchronized background color/gradient matching the card
+            let mut plate_paint = Paint::default();
+            if let Some(shader) = LinearGradient::new(
+                tiny_skia::Point::from_xy(w / 2.0, 0.0),
+                tiny_skia::Point::from_xy(w / 2.0, h),
+                vec![GradientStop::new(0.0, top_color), GradientStop::new(1.0, bottom_color)],
+                SpreadMode::Pad,
+                Transform::identity(),
+            ) {
+                plate_paint.shader = shader;
+            } else {
+                plate_paint.set_color(top_color);
+            }
+            output.fill_path(&path, &plate_paint, tiny_skia::FillRule::Winding, Transform::identity(), None);
+
+            // 2. Scale and center the existing squircle card with margin bleed over the synchronized background
             let transform = Transform::from_scale(scale, scale).post_translate(offset_x, offset_y);
             output.draw_pixmap(0, 0, source.as_ref(), &pixmap_paint, transform, Some(&mask));
         }
@@ -452,7 +523,7 @@ mod tests {
             ("Apifox", "/var/lib/flatpak/appstream/flathub/x86_64/70da372709099bbdd422326b03f09cdf46afe365999abb4aac127a5b9bc7f0ad/icons/128x128/com.apifox.Apifox.png", "squircle"),
             ("PeaZip", "/var/lib/flatpak/appstream/flathub/x86_64/70da372709099bbdd422326b03f09cdf46afe365999abb4aac127a5b9bc7f0ad/icons/128x128/io.github.peazip.PeaZip.png", "squircle"),
             ("Antigravity", "/home/eriz/.local/share/icons/hicolor/512x512/apps/antigravity.png", "squircle"),
-            ("Clash Verge", "/usr/share/icons/hicolor/128x128/apps/clash-verge.png", "cutout"),
+            ("Clash Verge", "/usr/share/icons/hicolor/128x128/apps/clash-verge.png", "circle"),
             ("lstopo (hwloc)", "/home/eriz/.local/share/icons/hicolor/scalable/apps/hwloc.svg", "cutout"),
             ("WeChat", "/usr/share/icons/hicolor/128x128/apps/wechat.png", "full_bleed"),
             ("CMake", "/usr/share/icons/hicolor/128x128/apps/CMakeSetup.png", "cutout"),
@@ -469,6 +540,10 @@ mod tests {
                 "squircle" => assert!(
                     matches!(profile, IconProfile::PreFramedSquircle { .. }),
                     "{name} expected PreFramedSquircle, got {:?}", profile
+                ),
+                "circle" => assert!(
+                    matches!(profile, IconProfile::UniformColoredCircle { .. }),
+                    "{name} expected UniformColoredCircle, got {:?}", profile
                 ),
                 "full_bleed" => assert!(
                     matches!(profile, IconProfile::FullBleed),
