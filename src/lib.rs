@@ -287,12 +287,23 @@ mod tests {
 
     #[test]
     fn test_render_system_apps_at_256() {
-        let apps = ["clash-verge", "antigravity", "hwloc", "com.apifox.Apifox", "bottles"];
+        let apps = [
+            "clash-verge",
+            "antigravity",
+            "hwloc",
+            "com.apifox.Apifox",
+            "bottles",
+            "network-wired",
+            "input-keyboard",
+            "preferences-desktop-user-password",
+            "preferences-system-performance",
+        ];
         let scratch_dir = Path::new("/home/eriz/.gemini/antigravity-cli/brain/308e8b3f-0aba-4c30-9671-c150b5adb7a4/scratch");
-        for app in apps {
+        for (i, app) in apps.iter().enumerate() {
             if let Some(bitmap) = render_icon(app, 256, PlateOptions::default()) {
                 if scratch_dir.exists() {
-                    let _ = bitmap.pixmap().save_png(scratch_dir.join(format!("test_render_256_{app}.png")));
+                    let name = app.replace('/', "_");
+                    let _ = bitmap.pixmap().save_png(scratch_dir.join(format!("test_render_256_{i}_{name}.png")));
                 }
             }
         }

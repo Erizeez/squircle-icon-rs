@@ -90,19 +90,70 @@ fn resolve_icon_uncached(icon_name: &str) -> Option<PathBuf> {
     }
 
     let roots = icon_search_roots();
-    let themes = ["hicolor", "Adwaita", "breeze", "gnome"];
-    // Prefer scalable SVGs first, then descending raster resolutions (including @2 high-DPI)
+    let themes = [
+        "hicolor",
+        "breeze",
+        "AdwaitaLegacy",
+        "Adwaita",
+        "breeze-dark",
+        "gnome",
+    ];
+    // Prefer scalable SVGs first, then descending raster resolutions (including @2 high-DPI and KDE numeric sizes)
     let sizes = [
         "scalable", "1024x1024", "512x512@2", "512x512", "256x256@2", "256x256",
-        "128x128@2", "128x128", "96x96", "64x64", "48x48", "32x32",
+        "128x128@2", "128x128", "96x96", "64x64", "48x48", "32x32", "24x24", "22x22", "16x16",
+        "64", "48", "32", "24", "22", "16", "symbolic",
     ];
-    let categories = ["apps", "mimetypes", "categories", "status", "places"];
+    let categories = [
+        "apps", "devices", "preferences", "categories", "status",
+        "mimetypes", "places", "legacy", "actions", "system",
+    ];
     let extensions = ["svg", "png", "webp", "xpm"];
 
     let has_graphic_ext = matches!(
         direct.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(),
         Some("svg" | "png" | "webp" | "xpm" | "jpg" | "jpeg" | "ico")
     );
+
+    // Helper closure to search standard theme trees for a set of names
+    let search_theme_trees = |names: &[String]| -> Option<PathBuf> {
+        for name in names {
+            for theme in &themes {
+                for root in &roots {
+                    if root.ends_with("pixmaps") {
+                        continue;
+                    }
+                    let theme_root = root.join(theme);
+                    if !theme_root.is_dir() {
+                        continue;
+                    }
+                    for size in &sizes {
+                        for category in &categories {
+                            // Support both GNOME (<size>/<category>) and KDE (<category>/<size>)
+                            for dir in [
+                                theme_root.join(size).join(category),
+                                theme_root.join(category).join(size),
+                            ] {
+                                let candidate = dir.join(name);
+                                if candidate.is_file() {
+                                    return Some(candidate);
+                                }
+                                if !has_graphic_ext {
+                                    for ext in extensions {
+                                        let candidate = dir.join(format!("{name}.{ext}"));
+                                        if candidate.is_file() {
+                                            return Some(candidate);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    };
 
     // 2. Search pixmaps roots
     for root in &roots {
@@ -124,36 +175,9 @@ fn resolve_icon_uncached(icon_name: &str) -> Option<PathBuf> {
         }
     }
 
-    // 3. Search standard theme trees
-    for name in &candidate_names {
-        for theme in &themes {
-            for root in &roots {
-                if root.ends_with("pixmaps") {
-                    continue;
-                }
-                let theme_root = root.join(theme);
-                if !theme_root.is_dir() {
-                    continue;
-                }
-                for size in &sizes {
-                    for category in &categories {
-                        let dir = theme_root.join(size).join(category);
-                        let candidate = dir.join(name);
-                        if candidate.is_file() {
-                            return Some(candidate);
-                        }
-                        if !has_graphic_ext {
-                            for ext in extensions {
-                                let candidate = dir.join(format!("{name}.{ext}"));
-                                if candidate.is_file() {
-                                    return Some(candidate);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+    // 3. Search standard theme trees for exact candidate names
+    if let Some(path) = search_theme_trees(&candidate_names) {
+        return Some(path);
     }
 
     // 4. Fallback: if a short name was searched (e.g. "bottles"), scan for reverse-DNS matches (e.g. "*.bottles.svg")
@@ -170,15 +194,19 @@ fn resolve_icon_uncached(icon_name: &str) -> Option<PathBuf> {
                 }
                 for size in &sizes {
                     for category in &categories {
-                        let dir = theme_root.join(size).join(category);
-                        if let Ok(entries) = std::fs::read_dir(&dir) {
-                            for entry in entries.flatten() {
-                                let file_name = entry.file_name();
-                                let name_str = file_name.to_string_lossy();
-                                for ext in extensions {
-                                    let target_suffix = format!("{suffix_dot}.{ext}");
-                                    if name_str.ends_with(&target_suffix) {
-                                        return Some(entry.path());
+                        for dir in [
+                            theme_root.join(size).join(category),
+                            theme_root.join(category).join(size),
+                        ] {
+                            if let Ok(entries) = std::fs::read_dir(&dir) {
+                                for entry in entries.flatten() {
+                                    let file_name = entry.file_name();
+                                    let name_str = file_name.to_string_lossy();
+                                    for ext in extensions {
+                                        let target_suffix = format!("{suffix_dot}.{ext}");
+                                        if name_str.ends_with(&target_suffix) {
+                                            return Some(entry.path());
+                                        }
                                     }
                                 }
                             }
@@ -187,6 +215,18 @@ fn resolve_icon_uncached(icon_name: &str) -> Option<PathBuf> {
                 }
             }
         }
+    }
+
+    // 5. Fallback to symbolic names (e.g. "network-wired" -> "network-wired-symbolic")
+    let symbolic_names: Vec<String> = candidate_names
+        .iter()
+        .filter(|n| !n.ends_with("-symbolic"))
+        .map(|n| format!("{n}-symbolic"))
+        .collect();
+    if !symbolic_names.is_empty()
+        && let Some(path) = search_theme_trees(&symbolic_names)
+    {
+        return Some(path);
     }
 
     None
@@ -218,5 +258,14 @@ mod tests {
         println!("resolve_icon('bottles') -> {:?}", r1);
         let r2 = resolve_icon("com.usebottles.bottles");
         println!("resolve_icon('com.usebottles.bottles') -> {:?}", r2);
+    }
+
+    #[test]
+    fn test_resolve_network_wired_and_devices() {
+        let r = resolve_icon("network-wired");
+        println!("resolve_icon('network-wired') -> {:?}", r);
+        assert!(r.is_some(), "network-wired should be resolved");
+        let path = r.unwrap();
+        assert!(path.is_file());
     }
 }
