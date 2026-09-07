@@ -302,6 +302,7 @@ mod tests {
     fn test_render_system_apps_at_256() {
         let apps = [
             "clash-verge",
+            "Alacritty",
             "antigravity",
             "hwloc",
             "com.apifox.Apifox",

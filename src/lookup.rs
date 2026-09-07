@@ -90,6 +90,17 @@ fn resolve_icon_uncached(icon_name: &str) -> Option<PathBuf> {
     {
         candidate_names.push(short_stem.to_string());
     }
+    let lower = icon_name.to_lowercase();
+    if lower != icon_name && !candidate_names.contains(&lower) {
+        candidate_names.push(lower);
+    }
+    let mut chars = icon_name.chars();
+    if let Some(first) = chars.next() {
+        let capitalized = format!("{}{}", first.to_uppercase(), chars.as_str());
+        if capitalized != icon_name && !candidate_names.contains(&capitalized) {
+            candidate_names.push(capitalized);
+        }
+    }
 
     let roots = icon_search_roots();
     let themes = [
@@ -282,8 +293,11 @@ mod tests {
         println!("icon_search_roots: {:?}", icon_search_roots());
         let r1 = resolve_icon("bottles");
         println!("resolve_icon('bottles') -> {:?}", r1);
-        let r2 = resolve_icon("com.usebottles.bottles");
-        println!("resolve_icon('com.usebottles.bottles') -> {:?}", r2);
+        println!("resolve_icon('com.usebottles.bottles') -> {:?}", resolve_icon("com.usebottles.bottles"));
+        println!("resolve_icon('Alacritty') -> {:?}", resolve_icon("Alacritty"));
+        println!("resolve_icon('alacritty') -> {:?}", resolve_icon("alacritty"));
+        assert!(resolve_icon("Alacritty").is_some());
+        assert!(resolve_icon("alacritty").is_some());
     }
 
     #[test]

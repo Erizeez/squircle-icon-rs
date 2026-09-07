@@ -164,4 +164,14 @@ mod tests {
         assert_eq!(edge_pixel.green(), 92);
         assert_eq!(edge_pixel.blue(), 100);
     }
+
+    #[test]
+    fn test_rasterize_alacritty() {
+        let p = Path::new("/usr/share/pixmaps/Alacritty.svg");
+        if p.is_file() {
+            let pix = rasterize_file(p, 256, 256).unwrap();
+            let visible = pix.pixels().iter().filter(|p| p.alpha() > 10).count();
+            assert!(visible > 50000, "Alacritty should render full raster content");
+        }
+    }
 }

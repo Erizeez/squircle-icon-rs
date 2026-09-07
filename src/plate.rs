@@ -132,20 +132,6 @@ pub fn detect_icon_profile(pixmap: &Pixmap) -> IconProfile {
         return IconProfile::FullBleed;
     }
 
-    // 1. Fast corner check for full-bleed icons
-    let inset = (w / 16).max(1);
-    let corners = [
-        (inset, inset),
-        (w - 1 - inset, inset),
-        (inset, h - 1 - inset),
-        (w - 1 - inset, h - 1 - inset),
-    ];
-    let corners_opaque = corners
-        .iter()
-        .all(|&(x, y)| pixmap.pixel(x, y).is_some_and(|p| p.alpha() > 200));
-    if corners_opaque {
-        return IconProfile::FullBleed;
-    }
 
     // 2. Scan bounding box and opaque pixel density
     let mut min_x = w;
@@ -348,7 +334,25 @@ pub fn apply_squircle_plate(source: &Pixmap, options: PlateOptions) -> Pixmap {
 
     match profile {
         IconProfile::FullBleed => {
-            // Full-bleed: render at scale 1.0 covering the tile, clipped to squircle
+            // Full-bleed: render at scale 1.0 covering the tile, clipped to squircle.
+            // Pre-fill squircle plate to guarantee that zero transparent holes exist inside the squircle mask.
+            let (top_color, bottom_color) = match options.theme {
+                PlateTheme::Light => (Color::WHITE, Color::from_rgba8(242, 242, 247, 255)),
+                PlateTheme::Dark => (Color::from_rgba8(48, 48, 51, 255), Color::from_rgba8(28, 28, 30, 255)),
+            };
+            let mut plate_paint = Paint::default();
+            if let Some(shader) = LinearGradient::new(
+                tiny_skia::Point::from_xy(w / 2.0, 0.0),
+                tiny_skia::Point::from_xy(w / 2.0, h),
+                vec![GradientStop::new(0.0, top_color), GradientStop::new(1.0, bottom_color)],
+                SpreadMode::Pad,
+                Transform::identity(),
+            ) {
+                plate_paint.shader = shader;
+            } else {
+                plate_paint.set_color(top_color);
+            }
+            output.fill_path(&path, &plate_paint, tiny_skia::FillRule::Winding, Transform::identity(), None);
             output.draw_pixmap(0, 0, source.as_ref(), &pixmap_paint, Transform::identity(), Some(&mask));
         }
         IconProfile::PreFramedSquircle {
@@ -527,6 +531,7 @@ mod tests {
             ("lstopo (hwloc)", "/home/eriz/.local/share/icons/hicolor/scalable/apps/hwloc.svg", "cutout"),
             ("WeChat", "/usr/share/icons/hicolor/128x128/apps/wechat.png", "full_bleed"),
             ("CMake", "/usr/share/icons/hicolor/128x128/apps/CMakeSetup.png", "cutout"),
+            ("Alacritty", "/usr/share/pixmaps/Alacritty.svg", "cutout"),
         ];
 
         for (name, path, expected) in targets {
