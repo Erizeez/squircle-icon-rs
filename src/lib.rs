@@ -7,6 +7,7 @@
 //! - Intelligent matting: automated cutout/circle detection and subtle Apple-style background plate generation.
 //! - High-performance raster output, PNG encoding, data URIs, and SVG-wrapped embeds.
 
+pub mod fallback;
 pub mod lookup;
 pub mod plate;
 pub mod raster;
@@ -15,6 +16,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
+pub use fallback::{render_fallback_icon, FALLBACK_APP_ICON_SVG};
 pub use lookup::{icon_search_roots, resolve_icon};
 pub use plate::{
     apply_squircle_plate, detect_icon_profile, is_cutout_icon, IconProfile, MattingStrategy,
@@ -154,15 +156,21 @@ impl AppIconEngine {
             return Some(entry.bitmap.clone());
         }
 
-        let path = if Path::new(name_or_path).is_file() {
-            PathBuf::from(name_or_path)
+        let bitmap = if name_or_path == "$fallback"
+            || name_or_path == "bmol://icons/fallback"
+            || name_or_path.is_empty()
+        {
+            render_fallback_icon(size, options)
         } else {
-            resolve_icon(name_or_path)?
+            let path = if Path::new(name_or_path).is_file() {
+                PathBuf::from(name_or_path)
+            } else {
+                resolve_icon(name_or_path)?
+            };
+            let raw_pixmap = rasterize_file(&path, size, size).ok()?;
+            let framed = apply_squircle_plate(&raw_pixmap, options);
+            IconBitmap::from_pixmap(framed)
         };
-
-        let raw_pixmap = rasterize_file(&path, size, size).ok()?;
-        let framed = apply_squircle_plate(&raw_pixmap, options);
-        let bitmap = IconBitmap::from_pixmap(framed);
         let svg_markup = bitmap.to_svg_markup();
 
         let entry = CacheEntry {
@@ -215,6 +223,11 @@ pub fn render_icon(name_or_path: &str, size: u32, options: PlateOptions) -> Opti
 /// Convenience function to render and squircle-frame an icon to an SVG markup string.
 pub fn render_svg_markup(name_or_path: &str, size: u32, options: PlateOptions) -> Option<String> {
     AppIconEngine::global().render_svg_markup(name_or_path, size, options)
+}
+
+/// Convenience function to render the Apple macOS-style blueprint generic application fallback icon.
+pub fn render_fallback(size: u32, options: PlateOptions) -> IconBitmap {
+    AppIconEngine::global().render("$fallback", size, options).unwrap()
 }
 
 fn base64_encode(bytes: &[u8]) -> String {
@@ -297,6 +310,7 @@ mod tests {
             "input-keyboard",
             "preferences-desktop-user-password",
             "preferences-system-performance",
+            "$fallback",
         ];
         let scratch_dir = Path::new("/home/eriz/.gemini/antigravity-cli/brain/308e8b3f-0aba-4c30-9671-c150b5adb7a4/scratch");
         for (i, app) in apps.iter().enumerate() {
@@ -307,5 +321,16 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_render_fallback_global() {
+        let bitmap = render_fallback(256, PlateOptions::default());
+        assert_eq!(bitmap.width(), 256);
+        assert_eq!(bitmap.height(), 256);
+        assert!(bitmap.to_png_bytes().is_ok());
+
+        let res = render_icon("$fallback", 64, PlateOptions::default());
+        assert!(res.is_some());
     }
 }
