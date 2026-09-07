@@ -2,8 +2,8 @@ use squircle_rs::{
     squircle_path_commands, PathCommand, SquircleParams, APPLE_CORNER_SMOOTHING,
 };
 use tiny_skia::{
-    Color, GradientStop, LinearGradient, Mask, Paint, Path, PathBuilder, Pixmap, PixmapPaint,
-    SpreadMode, Stroke, Transform,
+    Color, FillRule, GradientStop, LinearGradient, Mask, Paint, Path, PathBuilder, Pixmap,
+    PixmapPaint, Point, Rect, SpreadMode, Stroke, Transform,
 };
 
 /// Icon background plate styling theme.
@@ -72,6 +72,70 @@ pub fn build_squircle_path(
         }
     }
     pb.finish()
+}
+
+/// Builds a 2x supersampled (SSAA) anti-aliased mask for continuous curvature squircles.
+///
+/// Rasterizes the exact squircle path at 2x resolution with Skia analytic anti-aliasing,
+/// then downsamples using a 2x2 box filter into the destination mask.
+/// This yields multiple subpixel coverage levels, completely eliminating edge stepping and aliased burrs.
+pub fn build_supersampled_squircle_mask(
+    width: u32,
+    height: u32,
+    corner_radius: f32,
+    smoothing: f32,
+) -> Option<Mask> {
+    let scale = 2;
+    let w2 = width.checked_mul(scale)?;
+    let h2 = height.checked_mul(scale)?;
+    let r2 = corner_radius * scale as f32;
+
+    let path_2x = build_squircle_path(w2 as f32, h2 as f32, r2, smoothing)?;
+    let mut mask_2x = Mask::new(w2, h2)?;
+    mask_2x.fill_path(&path_2x, FillRule::Winding, true, Transform::identity());
+
+    let mut mask = Mask::new(width, height)?;
+    let src = mask_2x.data();
+    let dst = mask.data_mut();
+    let stride_2x = w2 as usize;
+    let w = width as usize;
+    let h = height as usize;
+
+    for y in 0..h {
+        let y2 = y * 2;
+        let row0 = y2 * stride_2x;
+        let row1 = (y2 + 1) * stride_2x;
+        let dst_row = y * w;
+        for x in 0..w {
+            let x2 = x * 2;
+            let p00 = src[row0 + x2] as u32;
+            let p01 = src[row0 + x2 + 1] as u32;
+            let p10 = src[row1 + x2] as u32;
+            let p11 = src[row1 + x2 + 1] as u32;
+            dst[dst_row + x] = ((p00 + p01 + p10 + p11 + 2) / 4) as u8;
+        }
+    }
+
+    Some(mask)
+}
+
+fn create_plate_paint(top_color: Color, bottom_color: Color, h: f32) -> Paint<'static> {
+    let mut paint = Paint::default();
+    if let Some(shader) = LinearGradient::new(
+        Point::from_xy(0.0, 0.0),
+        Point::from_xy(0.0, h),
+        vec![
+            GradientStop::new(0.0, top_color),
+            GradientStop::new(1.0, bottom_color),
+        ],
+        SpreadMode::Pad,
+        Transform::identity(),
+    ) {
+        paint.shader = shader;
+    } else {
+        paint.set_color(top_color);
+    }
+    paint
 }
 
 /// Detailed icon profile detected from spatial alpha distribution and color characteristics.
@@ -434,12 +498,13 @@ pub fn apply_squircle_plate(source: &Pixmap, options: PlateOptions) -> Pixmap {
         None => return source.clone(),
     };
 
-    // 1. Prepare continuous curvature squircle clipping mask
-    let mut mask = match Mask::new(width, height) {
-        Some(m) => m,
-        None => return output,
-    };
-    mask.fill_path(&path, tiny_skia::FillRule::Winding, true, Transform::identity());
+    // 1. Prepare continuous curvature squircle clipping mask with 2x SSAA supersampling
+    let mask = build_supersampled_squircle_mask(width, height, radius, APPLE_CORNER_SMOOTHING)
+        .unwrap_or_else(|| {
+            let mut m = Mask::new(width, height).unwrap();
+            m.fill_path(&path, FillRule::Winding, true, Transform::identity());
+            m
+        });
 
     // 2. Identify icon archetype
     let profile = match options.strategy {
@@ -457,34 +522,18 @@ pub fn apply_squircle_plate(source: &Pixmap, options: PlateOptions) -> Pixmap {
         MattingStrategy::Raw => unreachable!(),
     };
 
-
     let pixmap_paint = PixmapPaint {
         quality: tiny_skia::FilterQuality::Bicubic,
         ..Default::default()
     };
 
-    match profile {
+    let (top_color, bottom_color, artwork_transform) = match profile {
         IconProfile::FullBleed => {
-            // Full-bleed: render at scale 1.0 covering the tile, clipped to squircle.
-            // Pre-fill squircle plate to guarantee that zero transparent holes exist inside the squircle mask.
-            let (top_color, bottom_color) = match options.theme {
+            let (tc, bc) = match options.theme {
                 PlateTheme::Light => (Color::WHITE, Color::from_rgba8(242, 242, 247, 255)),
                 PlateTheme::Dark => (Color::from_rgba8(48, 48, 51, 255), Color::from_rgba8(28, 28, 30, 255)),
             };
-            let mut plate_paint = Paint::default();
-            if let Some(shader) = LinearGradient::new(
-                tiny_skia::Point::from_xy(w / 2.0, 0.0),
-                tiny_skia::Point::from_xy(w / 2.0, h),
-                vec![GradientStop::new(0.0, top_color), GradientStop::new(1.0, bottom_color)],
-                SpreadMode::Pad,
-                Transform::identity(),
-            ) {
-                plate_paint.shader = shader;
-            } else {
-                plate_paint.set_color(top_color);
-            }
-            output.fill_path(&path, &plate_paint, tiny_skia::FillRule::Winding, Transform::identity(), None);
-            output.draw_pixmap(0, 0, source.as_ref(), &pixmap_paint, Transform::identity(), Some(&mask));
+            (tc, bc, Transform::identity())
         }
         IconProfile::PreFramedSquircle {
             scale,
@@ -492,54 +541,23 @@ pub fn apply_squircle_plate(source: &Pixmap, options: PlateOptions) -> Pixmap {
             offset_y,
             top_color,
             bottom_color,
-        } => {
-            // Adaptive Fusion (Apifox, PeaZip, Antigravity):
-            // 1. Fill plate with synchronized background color/gradient matching the card
-            let mut plate_paint = Paint::default();
-            if let Some(shader) = LinearGradient::new(
-                tiny_skia::Point::from_xy(w / 2.0, 0.0),
-                tiny_skia::Point::from_xy(w / 2.0, h),
-                vec![GradientStop::new(0.0, top_color), GradientStop::new(1.0, bottom_color)],
-                SpreadMode::Pad,
-                Transform::identity(),
-            ) {
-                plate_paint.shader = shader;
-            } else {
-                plate_paint.set_color(top_color);
-            }
-            output.fill_path(&path, &plate_paint, tiny_skia::FillRule::Winding, Transform::identity(), None);
-
-            // 2. Scale and center the existing squircle card with margin bleed over the synchronized background
-            let transform = Transform::from_scale(scale, scale).post_translate(offset_x, offset_y);
-            output.draw_pixmap(0, 0, source.as_ref(), &pixmap_paint, transform, Some(&mask));
-        }
+        } => (
+            top_color,
+            bottom_color,
+            Transform::from_scale(scale, scale).post_translate(offset_x, offset_y),
+        ),
         IconProfile::UniformColoredCircle { top_color, bottom_color } => {
-            // Circular icon with uniform rim (e.g. Moonlight):
-            // Render adaptive plate matching the rim tone
-            let mut plate_paint = Paint::default();
-            if let Some(shader) = LinearGradient::new(
-                tiny_skia::Point::from_xy(w / 2.0, 0.0),
-                tiny_skia::Point::from_xy(w / 2.0, h),
-                vec![GradientStop::new(0.0, top_color), GradientStop::new(1.0, bottom_color)],
-                SpreadMode::Pad,
-                Transform::identity(),
-            ) {
-                plate_paint.shader = shader;
-            } else {
-                plate_paint.set_color(top_color);
-            }
-            output.fill_path(&path, &plate_paint, tiny_skia::FillRule::Winding, Transform::identity(), None);
-
             let scale = options.glyph_scale.clamp(0.5, 0.95);
             let dx = (w - (w * scale)) / 2.0;
             let dy = (h - (h * scale)) / 2.0;
-            let transform = Transform::from_scale(scale, scale).post_translate(dx, dy);
-            output.draw_pixmap(0, 0, source.as_ref(), &pixmap_paint, transform, Some(&mask));
+            (
+                top_color,
+                bottom_color,
+                Transform::from_scale(scale, scale).post_translate(dx, dy),
+            )
         }
         IconProfile::FloatingCutout { top_color: extracted_top, bottom_color: extracted_bottom } => {
-            // Floating glyph / cutout (Chrome, CMake, Fcitx5, lstopo, Alacritty):
-            // Intelligently use extracted adaptive plate colors if available, otherwise theme defaults
-            let (top_color, bottom_color) = match (extracted_top, extracted_bottom) {
+            let (tc, bc) = match (extracted_top, extracted_bottom) {
                 (Some(t), Some(b)) => (t, b),
                 (Some(t), None) => (t, t),
                 _ => match options.theme {
@@ -547,38 +565,29 @@ pub fn apply_squircle_plate(source: &Pixmap, options: PlateOptions) -> Pixmap {
                     PlateTheme::Dark => (Color::from_rgba8(48, 48, 51, 255), Color::from_rgba8(28, 28, 30, 255)),
                 },
             };
-            let mut plate_paint = Paint::default();
-            if let Some(shader) = LinearGradient::new(
-                tiny_skia::Point::from_xy(w / 2.0, 0.0),
-                tiny_skia::Point::from_xy(w / 2.0, h),
-                vec![GradientStop::new(0.0, top_color), GradientStop::new(1.0, bottom_color)],
-                SpreadMode::Pad,
-                Transform::identity(),
-            ) {
-                plate_paint.shader = shader;
-            } else {
-                plate_paint.set_color(top_color);
-            }
-            output.fill_path(&path, &plate_paint, tiny_skia::FillRule::Winding, Transform::identity(), None);
-
             let scale = options.glyph_scale.clamp(0.5, 0.95);
             let dx = (w - (w * scale)) / 2.0;
             let dy = (h - (h * scale)) / 2.0;
-            let transform = Transform::from_scale(scale, scale).post_translate(dx, dy);
-            output.draw_pixmap(0, 0, source.as_ref(), &pixmap_paint, transform, Some(&mask));
+            (
+                tc,
+                bc,
+                Transform::from_scale(scale, scale).post_translate(dx, dy),
+            )
         }
+    };
+
+    // 3. Render plate background over the entire canvas (zero premature edge clipping)
+    let plate_paint = create_plate_paint(top_color, bottom_color, h);
+    if let Some(rect) = Rect::from_xywh(0.0, 0.0, w, h) {
+        output.fill_rect(rect, &plate_paint, Transform::identity(), None);
     }
 
-    // Subtle hairline inner border clipped strictly inside squircle.
-    // When the plate surface is dark (either from Dark theme or extracted dark tones),
-    // use a crisp translucent white stroke (rgba 255, 255, 255, 30) to catch the rim light.
-    let is_dark_surface = match profile {
-        IconProfile::FloatingCutout { top_color: Some(top), .. } => {
-            let lum = 0.299 * top.red() + 0.587 * top.green() + 0.114 * top.blue();
-            lum < 0.45
-        }
-        _ => options.theme == PlateTheme::Dark,
-    };
+    // 4. Render the artwork/glyph
+    output.draw_pixmap(0, 0, source.as_ref(), &pixmap_paint, artwork_transform, None);
+
+    // 5. Subtle hairline inner border
+    let lum = 0.299 * top_color.red() + 0.587 * top_color.green() + 0.114 * top_color.blue();
+    let is_dark_surface = lum < 0.45 || options.theme == PlateTheme::Dark;
     let border_color = if is_dark_surface {
         Color::from_rgba8(255, 255, 255, 30)
     } else {
@@ -595,7 +604,10 @@ pub fn apply_squircle_plate(source: &Pixmap, options: PlateOptions) -> Pixmap {
         width: border_width,
         ..Default::default()
     };
-    output.stroke_path(&path, &stroke_paint, &stroke, Transform::identity(), Some(&mask));
+    output.stroke_path(&path, &stroke_paint, &stroke, Transform::identity(), None);
+
+    // 6. Apply 2x SSAA continuous squircle clipping mask in a single unified pass
+    output.apply_mask(&mask);
 
     output
 }
