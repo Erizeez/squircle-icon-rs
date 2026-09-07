@@ -327,6 +327,28 @@ mod tests {
     }
 
     #[test]
+    fn test_apifox_and_steam_resolution_and_rendering() {
+        if let Some(path) = resolve_icon("steam") {
+            let path_str = path.to_string_lossy();
+            assert!(
+                path_str.contains("256x256") || path_str.ends_with(".svg") || path_str.contains("512x512"),
+                "Expected high-res icon for steam, got: {path_str}"
+            );
+            let bitmap = render_icon("steam", 256, PlateOptions::default()).expect("render steam");
+            assert_eq!(bitmap.width(), 256);
+            assert_eq!(bitmap.height(), 256);
+        }
+
+        if let Some(bitmap) = render_icon("com.apifox.Apifox", 256, PlateOptions::default()) {
+            assert_eq!(bitmap.width(), 256);
+            assert_eq!(bitmap.height(), 256);
+            let pix = bitmap.pixmap();
+            let center = pix.pixel(128, 128).unwrap();
+            assert_eq!(center.alpha(), 255);
+        }
+    }
+
+    #[test]
     fn test_render_fallback_global() {
         let bitmap = render_fallback(256, PlateOptions::default());
         assert_eq!(bitmap.width(), 256);

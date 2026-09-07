@@ -128,19 +128,20 @@ fn resolve_icon_uncached(icon_name: &str) -> Option<PathBuf> {
         Some("svg" | "png" | "webp" | "xpm" | "jpg" | "jpeg" | "ico")
     );
 
-    // Helper closure to search standard theme trees for a set of names
+    // Helper closure to search standard theme trees for a set of names.
+    // Prioritizes highest resolution sizes (scalable, 1024, 512, 256) first across themes and roots.
     let search_theme_trees = |names: &[String]| -> Option<PathBuf> {
         for name in names {
             for theme in &themes {
-                for root in &roots {
-                    if root.ends_with("pixmaps") {
-                        continue;
-                    }
-                    let theme_root = root.join(theme);
-                    if !theme_root.is_dir() {
-                        continue;
-                    }
-                    for size in &sizes {
+                for size in &sizes {
+                    for root in &roots {
+                        if root.ends_with("pixmaps") {
+                            continue;
+                        }
+                        let theme_root = root.join(theme);
+                        if !theme_root.is_dir() {
+                            continue;
+                        }
                         for category in &categories {
                             // Support both GNOME (<size>/<category>) and KDE (<category>/<size>)
                             for dir in [
@@ -168,34 +169,17 @@ fn resolve_icon_uncached(icon_name: &str) -> Option<PathBuf> {
         None
     };
 
-    // 2. Search pixmaps roots
-    for root in &roots {
-        if root.ends_with("pixmaps") {
-            for name in &candidate_names {
-                let candidate = root.join(name);
-                if candidate.is_file() {
-                    return Some(candidate);
-                }
-                if !has_graphic_ext {
-                    for ext in extensions {
-                        let candidate = root.join(format!("{name}.{ext}"));
-                        if candidate.is_file() {
-                            return Some(candidate);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // 3. Search standard theme trees for exact candidate names
+    // 2. Search standard theme trees for exact candidate names
     if let Some(path) = search_theme_trees(&candidate_names) {
         return Some(path);
     }
 
-    // Direct size roots (e.g. Flatpak appstream <root>/<size>/<name>.<ext>)
-    for root in &roots {
-        for size in &sizes {
+    // 3. Direct size roots (e.g. Flatpak appstream <root>/<size>/<name>.<ext>)
+    for size in &sizes {
+        for root in &roots {
+            if root.ends_with("pixmaps") {
+                continue;
+            }
             let dir = root.join(size);
             if !dir.is_dir() {
                 continue;
@@ -217,34 +201,58 @@ fn resolve_icon_uncached(icon_name: &str) -> Option<PathBuf> {
         }
     }
 
-    // 4. Fallback: if a short name was searched (e.g. "bottles"), scan for reverse-DNS matches (e.g. "*.bottles.svg")
+    // 4. Fallback: if a short name was searched (e.g. "bottles" or "apifox"), scan for reverse-DNS matches (e.g. "*.bottles.svg")
     if !icon_name.contains('.') {
-        let suffix_dot = format!(".{icon_name}");
-        for root in &roots {
-            if root.ends_with("pixmaps") {
-                continue;
-            }
+        for name in &candidate_names {
+            let suffix_dot = format!(".{name}").to_lowercase();
+            // Search theme trees
             for theme in &themes {
-                let theme_root = root.join(theme);
-                if !theme_root.is_dir() {
-                    continue;
-                }
                 for size in &sizes {
-                    for category in &categories {
-                        for dir in [
-                            theme_root.join(size).join(category),
-                            theme_root.join(category).join(size),
-                        ] {
-                            if let Ok(entries) = std::fs::read_dir(&dir) {
-                                for entry in entries.flatten() {
-                                    let file_name = entry.file_name();
-                                    let name_str = file_name.to_string_lossy();
-                                    for ext in extensions {
-                                        let target_suffix = format!("{suffix_dot}.{ext}");
-                                        if name_str.ends_with(&target_suffix) {
-                                            return Some(entry.path());
+                    for root in &roots {
+                        if root.ends_with("pixmaps") {
+                            continue;
+                        }
+                        let theme_root = root.join(theme);
+                        if !theme_root.is_dir() {
+                            continue;
+                        }
+                        for category in &categories {
+                            for dir in [
+                                theme_root.join(size).join(category),
+                                theme_root.join(category).join(size),
+                            ] {
+                                if let Ok(entries) = std::fs::read_dir(&dir) {
+                                    for entry in entries.flatten() {
+                                        let file_name = entry.file_name();
+                                        let name_str = file_name.to_string_lossy().to_lowercase();
+                                        for ext in extensions {
+                                            let target_suffix = format!("{suffix_dot}.{ext}");
+                                            if name_str.ends_with(&target_suffix) {
+                                                return Some(entry.path());
+                                            }
                                         }
                                     }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // Also search direct size roots (Flatpak appstream)
+            for size in &sizes {
+                for root in &roots {
+                    if root.ends_with("pixmaps") {
+                        continue;
+                    }
+                    let dir = root.join(size);
+                    if let Ok(entries) = std::fs::read_dir(&dir) {
+                        for entry in entries.flatten() {
+                            let file_name = entry.file_name();
+                            let name_str = file_name.to_string_lossy().to_lowercase();
+                            for ext in extensions {
+                                let target_suffix = format!("{suffix_dot}.{ext}");
+                                if name_str.ends_with(&target_suffix) {
+                                    return Some(entry.path());
                                 }
                             }
                         }
@@ -264,6 +272,26 @@ fn resolve_icon_uncached(icon_name: &str) -> Option<PathBuf> {
         && let Some(path) = search_theme_trees(&symbolic_names)
     {
         return Some(path);
+    }
+
+    // 6. Search pixmaps roots (fallback of last resort per XDG Icon Theme Spec)
+    for root in &roots {
+        if root.ends_with("pixmaps") {
+            for name in &candidate_names {
+                let candidate = root.join(name);
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+                if !has_graphic_ext {
+                    for ext in extensions {
+                        let candidate = root.join(format!("{name}.{ext}"));
+                        if candidate.is_file() {
+                            return Some(candidate);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     None
@@ -296,6 +324,7 @@ mod tests {
         println!("resolve_icon('com.usebottles.bottles') -> {:?}", resolve_icon("com.usebottles.bottles"));
         println!("resolve_icon('Alacritty') -> {:?}", resolve_icon("Alacritty"));
         println!("resolve_icon('alacritty') -> {:?}", resolve_icon("alacritty"));
+        println!("resolve_icon('steam') -> {:?}", resolve_icon("steam"));
         assert!(resolve_icon("Alacritty").is_some());
         assert!(resolve_icon("alacritty").is_some());
     }

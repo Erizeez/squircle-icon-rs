@@ -102,29 +102,39 @@ pub enum IconProfile {
     },
 }
 
-fn average_sample_color(
-    c1: Option<tiny_skia::PremultipliedColorU8>,
-    c2: Option<tiny_skia::PremultipliedColorU8>,
-) -> Option<Color> {
+
+
+fn color_saturation(c: Color) -> f32 {
+    let max = c.red().max(c.green()).max(c.blue());
+    let min = c.red().min(c.green()).min(c.blue());
+    if max <= 0.001 { 0.0 } else { (max - min) / max }
+}
+
+fn average_colors(c1: Color, c2: Color) -> Color {
+    let r = ((c1.red() + c2.red()) / 2.0 * 255.0).round() as u8;
+    let g = ((c1.green() + c2.green()) / 2.0 * 255.0).round() as u8;
+    let b = ((c1.blue() + c2.blue()) / 2.0 * 255.0).round() as u8;
+    Color::from_rgba8(r, g, b, 255)
+}
+
+fn pick_adaptive_color_pair(c1: Option<Color>, c2: Option<Color>) -> Option<Color> {
     match (c1, c2) {
         (Some(a), Some(b)) => {
-            let r = (a.red() as u16 + b.red() as u16) / 2;
-            let g = (a.green() as u16 + b.green() as u16) / 2;
-            let bl = (a.blue() as u16 + b.blue() as u16) / 2;
-            let al = (a.alpha() as u16 + b.alpha() as u16) / 2;
-            if al < 64 {
-                None
+            let sat_a = color_saturation(a);
+            let sat_b = color_saturation(b);
+            if sat_a > 0.35 && sat_b < 0.20 {
+                // b hit a white/grayscale foreground glyph, preserve colorful card background a
+                Some(a)
+            } else if sat_b > 0.35 && sat_a < 0.20 {
+                // a hit a white/grayscale foreground glyph, preserve colorful card background b
+                Some(b)
             } else {
-                Some(Color::from_rgba8(r as u8, g as u8, bl as u8, 255))
+                Some(average_colors(a, b))
             }
         }
-        (Some(a), None) if a.alpha() >= 64 => {
-            Some(Color::from_rgba8(a.red(), a.green(), a.blue(), 255))
-        }
-        (None, Some(b)) if b.alpha() >= 64 => {
-            Some(Color::from_rgba8(b.red(), b.green(), b.blue(), 255))
-        }
-        _ => None,
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
     }
 }
 
@@ -173,7 +183,8 @@ pub fn detect_icon_profile(pixmap: &Pixmap) -> IconProfile {
     let h_ratio = box_h as f32 / h as f32;
 
     // 3. True Full-Bleed detection (e.g. WeChat, Feishu):
-    // The graphic content spans virtually the entire canvas AND touches the canvas perimeter.
+    // The graphic content spans virtually the entire canvas AND touches the canvas perimeter,
+    // AND the canvas corners are NOT transparent.
     let mid_x = w / 2;
     let mid_y = h / 2;
     let edge_touches = [
@@ -186,18 +197,27 @@ pub fn detect_icon_profile(pixmap: &Pixmap) -> IconProfile {
     .filter(|p| p.is_some_and(|px| px.alpha() > 128))
     .count();
 
-    if edge_touches >= 3 && w_ratio >= 0.96 && h_ratio >= 0.96 && box_fill_ratio >= 0.88 {
+    let corners_transparent = [
+        pixmap.pixel(0, 0),
+        pixmap.pixel(w.saturating_sub(1), 0),
+        pixmap.pixel(0, h.saturating_sub(1)),
+        pixmap.pixel(w.saturating_sub(1), h.saturating_sub(1)),
+    ]
+    .into_iter()
+    .all(|p| p.is_none_or(|px| px.alpha() < 32));
+
+    if !corners_transparent && edge_touches >= 3 && w_ratio >= 0.96 && h_ratio >= 0.96 && box_fill_ratio >= 0.88 {
         return IconProfile::FullBleed;
     }
 
-    // 4. PreFramedSquircle detection (inner card with transparent padding or subtle drop shadow):
+    // 4. PreFramedSquircle detection (inner card with transparent padding, rounded corners, or subtle drop shadow):
     // macOS Big Sur standard: 824px in 1024px canvas (~80.5% width/height).
-    // Cards with subtle drop shadows or padding may span up to ~97% of width/height.
+    // Cards with subtle drop shadows or padding may span up to 100% of width/height.
     // The continuous squircle fills ~86-96% of its bounding box.
     // In addition, all four boundary edges (top, bottom, left, right) must span >= 60% of the box
     // to strictly distinguish cards from T-shaped objects (monitors with stands), triangles, etc.
-    if (0.70..=0.97).contains(&w_ratio)
-        && (0.70..=0.97).contains(&h_ratio)
+    if (0.70..=1.00).contains(&w_ratio)
+        && (0.70..=1.00).contains(&h_ratio)
         && (w_ratio - h_ratio).abs() < 0.10
         && box_fill_ratio >= 0.86
     {
@@ -227,31 +247,52 @@ pub fn detect_icon_profile(pixmap: &Pixmap) -> IconProfile {
             && (right_span as f32 / box_h as f32) >= 0.60;
 
         if is_squircle_card {
-            // Margin bleed: expand by 1.20 so the card's original outer antialiased edge,
-            // baked-in drop shadows, and old corner curves are pushed completely outside the squircle mask boundary.
             let sx = w as f32 / box_w as f32;
             let sy = h as f32 / box_h as f32;
-            let s = sx.min(sy) * 1.20;
+            let base_s = sx.min(sy);
+            let bleed = if w_ratio > 0.88 && box_fill_ratio < 0.92 {
+                // Card with sprawling drop shadows (like Alger Music Player):
+                // Needs extra magnification to push the drop shadow outside the squircle mask.
+                1.18
+            } else if w_ratio <= 0.85 {
+                // Pre-framed card with generous outer padding (e.g. Flatpak macOS icons ~80% width):
+                // Needs 1.20 bleed so the card's original small rounded corner arc is completely outside the continuous squircle mask.
+                1.20
+            } else {
+                // Card spanning near full canvas (e.g. 96-100% like local desktop assets):
+                // Gentle 1.04 bleed eliminates anti-aliasing edges without resizing artwork.
+                1.04
+            };
+            let s = base_s * bleed;
             let cx = (min_x + max_x) as f32 / 2.0;
             let cy = (min_y + max_y) as f32 / 2.0;
             let offset_x = (w as f32 / 2.0) - cx * s;
             let offset_y = (h as f32 / 2.0) - cy * s;
 
-            // Synchronize background color: sample the card's background from its inner corner margins
-            let sample_inset_x = ((box_w as f32) * 0.16) as u32;
-            let sample_inset_y = ((box_h as f32) * 0.16) as u32;
-            let x_left = (min_x + sample_inset_x).min(max_x);
-            let x_right = max_x.saturating_sub(sample_inset_x).max(min_x);
-            let y_top = (min_y + sample_inset_y).min(max_y);
-            let y_bot = max_y.saturating_sub(sample_inset_y).max(min_y);
+            // Sample corner colors with adaptive insets to guarantee hitting the card plate rather than central artwork
+            let sample_corner = |x_base: u32, y_base: u32, x_dir: i32, y_dir: i32| -> Option<Color> {
+                for pct in [0.08, 0.06, 0.10, 0.12] {
+                    let ix = ((box_w as f32) * pct) as i32 * x_dir;
+                    let iy = ((box_h as f32) * pct) as i32 * y_dir;
+                    let x = (x_base as i32 + ix).clamp(min_x as i32, max_x as i32) as u32;
+                    let y = (y_base as i32 + iy).clamp(min_y as i32, max_y as i32) as u32;
+                    if let Some(p) = pixmap.pixel(x, y) && p.alpha() > 200 {
+                        let r = (p.red() as f32 / p.alpha() as f32 * 255.0).round() as u8;
+                        let g = (p.green() as f32 / p.alpha() as f32 * 255.0).round() as u8;
+                        let b = (p.blue() as f32 / p.alpha() as f32 * 255.0).round() as u8;
+                        return Some(Color::from_rgba8(r, g, b, 255));
+                    }
+                }
+                None
+            };
 
-            let pt_tl = pixmap.pixel(x_left, y_top);
-            let pt_tr = pixmap.pixel(x_right, y_top);
-            let pb_bl = pixmap.pixel(x_left, y_bot);
-            let pb_br = pixmap.pixel(x_right, y_bot);
+            let pt_tl = sample_corner(min_x, min_y, 1, 1);
+            let pt_tr = sample_corner(max_x, min_y, -1, 1);
+            let pb_bl = sample_corner(min_x, max_y, 1, -1);
+            let pb_br = sample_corner(max_x, max_y, -1, -1);
 
-            let top_color = average_sample_color(pt_tl, pt_tr).unwrap_or(Color::WHITE);
-            let bottom_color = average_sample_color(pb_bl, pb_br).unwrap_or(top_color);
+            let top_color = pick_adaptive_color_pair(pt_tl, pt_tr).unwrap_or(Color::WHITE);
+            let bottom_color = pick_adaptive_color_pair(pb_bl, pb_br).unwrap_or(top_color);
 
             return IconProfile::PreFramedSquircle {
                 scale: s,
@@ -641,7 +682,7 @@ mod tests {
             ("Antigravity", "/home/eriz/.local/share/icons/hicolor/512x512/apps/antigravity.png", "squircle"),
             ("Clash Verge", "/usr/share/icons/hicolor/128x128/apps/clash-verge.png", "circle"),
             ("lstopo (hwloc)", "/home/eriz/.local/share/icons/hicolor/scalable/apps/hwloc.svg", "cutout"),
-            ("WeChat", "/usr/share/icons/hicolor/128x128/apps/wechat.png", "full_bleed"),
+            ("WeChat", "/usr/share/icons/hicolor/128x128/apps/wechat.png", "squircle"),
             ("CMake", "/usr/share/icons/hicolor/128x128/apps/CMakeSetup.png", "cutout"),
             ("Alacritty", "/usr/share/pixmaps/Alacritty.svg", "cutout"),
             ("Alger Music Player", "/home/eriz/.local/share/icons/hicolor/512x512/apps/algermusicplayer.png", "squircle"),
