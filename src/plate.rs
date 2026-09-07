@@ -172,20 +172,34 @@ pub fn detect_icon_profile(pixmap: &Pixmap) -> IconProfile {
     let w_ratio = box_w as f32 / w as f32;
     let h_ratio = box_h as f32 / h as f32;
 
-    // 3. Full-bleed if bounding box covers the canvas (e.g. WeChat, Feishu)
-    if w_ratio >= 0.94 && h_ratio >= 0.94 && box_fill_ratio >= 0.88 {
+    // 3. True Full-Bleed detection (e.g. WeChat, Feishu):
+    // The graphic content spans virtually the entire canvas AND touches the canvas perimeter.
+    let mid_x = w / 2;
+    let mid_y = h / 2;
+    let edge_touches = [
+        pixmap.pixel(mid_x, 0).or_else(|| pixmap.pixel(mid_x, 1)),
+        pixmap.pixel(mid_x, h.saturating_sub(1)).or_else(|| pixmap.pixel(mid_x, h.saturating_sub(2))),
+        pixmap.pixel(0, mid_y).or_else(|| pixmap.pixel(1, mid_y)),
+        pixmap.pixel(w.saturating_sub(1), mid_y).or_else(|| pixmap.pixel(w.saturating_sub(2), mid_y)),
+    ]
+    .into_iter()
+    .filter(|p| p.is_some_and(|px| px.alpha() > 128))
+    .count();
+
+    if edge_touches >= 3 && w_ratio >= 0.96 && h_ratio >= 0.96 && box_fill_ratio >= 0.88 {
         return IconProfile::FullBleed;
     }
 
-    // 4. PreFramedSquircle detection (inner card with transparent padding):
+    // 4. PreFramedSquircle detection (inner card with transparent padding or subtle drop shadow):
     // macOS Big Sur standard: 824px in 1024px canvas (~80.5% width/height).
-    // The continuous squircle fills ~91-96% of its bounding box.
+    // Cards with subtle drop shadows or padding may span up to ~97% of width/height.
+    // The continuous squircle fills ~86-96% of its bounding box.
     // In addition, all four boundary edges (top, bottom, left, right) must span >= 60% of the box
     // to strictly distinguish cards from T-shaped objects (monitors with stands), triangles, etc.
-    if (0.70..=0.92).contains(&w_ratio)
-        && (0.70..=0.92).contains(&h_ratio)
+    if (0.70..=0.97).contains(&w_ratio)
+        && (0.70..=0.97).contains(&h_ratio)
         && (w_ratio - h_ratio).abs() < 0.10
-        && box_fill_ratio >= 0.88
+        && box_fill_ratio >= 0.86
     {
         let inset_y = (box_h / 16).max(3);
         let y_top = min_y + inset_y;
@@ -279,54 +293,66 @@ pub fn detect_icon_profile(pixmap: &Pixmap) -> IconProfile {
 
     // 5. Default: floating cutout / multi-color badge / irregular glyph.
     // Intelligently extract ambient/background colors instead of blindly falling back to white:
-    // When an icon represents a dark terminal/IDE, dark window frame, or dark-themed app
+    // When an icon represents a solid dark terminal/IDE, dark window frame, or dark-themed app container
     // (e.g. Alacritty, Kitty, Neovim, terminal utilities), extract its ambient dark slate/charcoal tones.
-    let mut dark_count = 0u64;
-    for pixel in pixmap.pixels() {
-        if pixel.alpha() > 48 {
-            let max_c = pixel.red().max(pixel.green()).max(pixel.blue());
-            if max_c < 80 {
-                dark_count += 1;
+    // IMPORTANT: Dark plates must NEVER be applied to sparse wireframes or monochrome silhouettes
+    // (e.g. network-wired / avahi, hwloc, keyboard outlines) where dark foreground on dark plate
+    // destroys contrast and renders the icon invisible.
+    let total_pixels = (w * h) as f32;
+    let canvas_fill_ratio = opaque_count as f32 / total_pixels;
+
+    let is_solid_host_card = box_fill_ratio >= 0.70
+        && canvas_fill_ratio >= 0.50
+        && w_ratio >= 0.75
+        && h_ratio >= 0.75;
+
+    if is_solid_host_card {
+        let mut dark_count = 0u64;
+        for pixel in pixmap.pixels() {
+            if pixel.alpha() > 48 {
+                let max_c = pixel.red().max(pixel.green()).max(pixel.blue());
+                if max_c < 80 {
+                    dark_count += 1;
+                }
             }
         }
-    }
-    let dark_ratio = dark_count as f32 / opaque_count.max(1) as f32;
-    if dark_ratio >= 0.40 {
-        // Sample dark frame / ambient tone from bottom perimeter
-        let inset_y = (box_h / 8).max(2);
-        let mut bot_r = 0u32;
-        let mut bot_g = 0u32;
-        let mut bot_b = 0u32;
-        let mut bot_n = 0u32;
-        let y_sample = max_y.saturating_sub(inset_y).max(min_y);
-        for x in (min_x + box_w / 4)..=(max_x.saturating_sub(box_w / 4)) {
-            if let Some(p) = pixmap.pixel(x, y_sample) && p.alpha() > 48 {
-                bot_r += p.red() as u32;
-                bot_g += p.green() as u32;
-                bot_b += p.blue() as u32;
-                bot_n += 1;
+        let dark_ratio = dark_count as f32 / opaque_count.max(1) as f32;
+        if dark_ratio >= 0.45 {
+            // Sample dark frame / ambient tone from bottom perimeter
+            let inset_y = (box_h / 8).max(2);
+            let mut bot_r = 0u32;
+            let mut bot_g = 0u32;
+            let mut bot_b = 0u32;
+            let mut bot_n = 0u32;
+            let y_sample = max_y.saturating_sub(inset_y).max(min_y);
+            for x in (min_x + box_w / 4)..=(max_x.saturating_sub(box_w / 4)) {
+                if let Some(p) = pixmap.pixel(x, y_sample) && p.alpha() > 48 {
+                    bot_r += p.red() as u32;
+                    bot_g += p.green() as u32;
+                    bot_b += p.blue() as u32;
+                    bot_n += 1;
+                }
             }
+            let (br, bg, bb) = match bot_n {
+                0 => (35, 37, 43),
+                n => (bot_r / n, bot_g / n, bot_b / n),
+            };
+
+            // Anchor dark surface luminance to macOS HIG standards (~28-48 top, ~16-26 bottom)
+            // keeping the hue/saturation from the icon's authentic palette
+            let top_r = ((br as f32) * 0.55).clamp(26.0, 48.0) as u8;
+            let top_g = ((bg as f32) * 0.55).clamp(28.0, 50.0) as u8;
+            let top_b = ((bb as f32) * 0.55).clamp(32.0, 56.0) as u8;
+
+            let bot_r = ((br as f32) * 0.30).clamp(14.0, 26.0) as u8;
+            let bot_g = ((bg as f32) * 0.30).clamp(15.0, 28.0) as u8;
+            let bot_b = ((bb as f32) * 0.30).clamp(18.0, 32.0) as u8;
+
+            return IconProfile::FloatingCutout {
+                top_color: Some(Color::from_rgba8(top_r, top_g, top_b, 255)),
+                bottom_color: Some(Color::from_rgba8(bot_r, bot_g, bot_b, 255)),
+            };
         }
-        let (br, bg, bb) = if bot_n > 0 {
-            (bot_r / bot_n, bot_g / bot_n, bot_b / bot_n)
-        } else {
-            (35, 37, 43)
-        };
-
-        // Anchor dark surface luminance to macOS HIG standards (~28-48 top, ~16-26 bottom)
-        // keeping the hue/saturation from the icon's authentic palette
-        let top_r = ((br as f32) * 0.55).clamp(26.0, 48.0) as u8;
-        let top_g = ((bg as f32) * 0.55).clamp(28.0, 50.0) as u8;
-        let top_b = ((bb as f32) * 0.55).clamp(32.0, 56.0) as u8;
-
-        let bot_r = ((br as f32) * 0.30).clamp(14.0, 26.0) as u8;
-        let bot_g = ((bg as f32) * 0.30).clamp(15.0, 28.0) as u8;
-        let bot_b = ((bb as f32) * 0.30).clamp(18.0, 32.0) as u8;
-
-        return IconProfile::FloatingCutout {
-            top_color: Some(Color::from_rgba8(top_r, top_g, top_b, 255)),
-            bottom_color: Some(Color::from_rgba8(bot_r, bot_g, bot_b, 255)),
-        };
     }
 
     IconProfile::FloatingCutout {
@@ -618,6 +644,8 @@ mod tests {
             ("WeChat", "/usr/share/icons/hicolor/128x128/apps/wechat.png", "full_bleed"),
             ("CMake", "/usr/share/icons/hicolor/128x128/apps/CMakeSetup.png", "cutout"),
             ("Alacritty", "/usr/share/pixmaps/Alacritty.svg", "cutout"),
+            ("Alger Music Player", "/home/eriz/.local/share/icons/hicolor/512x512/apps/algermusicplayer.png", "squircle"),
+            ("network-wired", "/usr/share/icons/breeze/devices/24/network-wired.svg", "cutout_light"),
         ];
 
         for (name, path, expected) in targets {
@@ -651,6 +679,12 @@ mod tests {
                             assert!(bottom_color.is_some(), "Alacritty should have extracted dark adaptive plate bottom color");
                         }
                     }
+                }
+                "cutout_light" => {
+                    assert!(
+                        matches!(profile, IconProfile::FloatingCutout { top_color: None, bottom_color: None }),
+                        "{name} expected FloatingCutout with default light plate, got {:?}", profile
+                    );
                 }
                 _ => {}
             }

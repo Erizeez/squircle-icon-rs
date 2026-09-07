@@ -312,6 +312,7 @@ mod tests {
             "input-keyboard",
             "preferences-desktop-user-password",
             "preferences-system-performance",
+            "algermusicplayer",
             "$fallback",
         ];
         let scratch_dir = Path::new("/home/eriz/.gemini/antigravity-cli/brain/308e8b3f-0aba-4c30-9671-c150b5adb7a4/scratch");
