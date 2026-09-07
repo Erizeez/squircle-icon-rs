@@ -94,8 +94,12 @@ pub enum IconProfile {
         top_color: Color,
         bottom_color: Color,
     },
-    /// Cutout glyph or multi-color badge (e.g. Chrome, CMake, Fcitx5).
-    FloatingCutout,
+    /// Cutout glyph or multi-color badge (e.g. Chrome, CMake, Fcitx5, Alacritty).
+    /// May contain intelligently extracted adaptive background plate colors (e.g. for dark terminal apps or solid bodies).
+    FloatingCutout {
+        top_color: Option<Color>,
+        bottom_color: Option<Color>,
+    },
 }
 
 fn average_sample_color(
@@ -155,7 +159,10 @@ pub fn detect_icon_profile(pixmap: &Pixmap) -> IconProfile {
     }
 
     if max_x < min_x || max_y < min_y || opaque_count == 0 {
-        return IconProfile::FloatingCutout;
+        return IconProfile::FloatingCutout {
+            top_color: None,
+            bottom_color: None,
+        };
     }
 
     let box_w = max_x - min_x + 1;
@@ -270,8 +277,62 @@ pub fn detect_icon_profile(pixmap: &Pixmap) -> IconProfile {
         }
     }
 
-    // 5. Default: floating cutout / multi-color badge / irregular glyph
-    IconProfile::FloatingCutout
+    // 5. Default: floating cutout / multi-color badge / irregular glyph.
+    // Intelligently extract ambient/background colors instead of blindly falling back to white:
+    // When an icon represents a dark terminal/IDE, dark window frame, or dark-themed app
+    // (e.g. Alacritty, Kitty, Neovim, terminal utilities), extract its ambient dark slate/charcoal tones.
+    let mut dark_count = 0u64;
+    for pixel in pixmap.pixels() {
+        if pixel.alpha() > 48 {
+            let max_c = pixel.red().max(pixel.green()).max(pixel.blue());
+            if max_c < 80 {
+                dark_count += 1;
+            }
+        }
+    }
+    let dark_ratio = dark_count as f32 / opaque_count.max(1) as f32;
+    if dark_ratio >= 0.40 {
+        // Sample dark frame / ambient tone from bottom perimeter
+        let inset_y = (box_h / 8).max(2);
+        let mut bot_r = 0u32;
+        let mut bot_g = 0u32;
+        let mut bot_b = 0u32;
+        let mut bot_n = 0u32;
+        let y_sample = max_y.saturating_sub(inset_y).max(min_y);
+        for x in (min_x + box_w / 4)..=(max_x.saturating_sub(box_w / 4)) {
+            if let Some(p) = pixmap.pixel(x, y_sample) && p.alpha() > 48 {
+                bot_r += p.red() as u32;
+                bot_g += p.green() as u32;
+                bot_b += p.blue() as u32;
+                bot_n += 1;
+            }
+        }
+        let (br, bg, bb) = if bot_n > 0 {
+            (bot_r / bot_n, bot_g / bot_n, bot_b / bot_n)
+        } else {
+            (35, 37, 43)
+        };
+
+        // Anchor dark surface luminance to macOS HIG standards (~28-48 top, ~16-26 bottom)
+        // keeping the hue/saturation from the icon's authentic palette
+        let top_r = ((br as f32) * 0.55).clamp(26.0, 48.0) as u8;
+        let top_g = ((bg as f32) * 0.55).clamp(28.0, 50.0) as u8;
+        let top_b = ((bb as f32) * 0.55).clamp(32.0, 56.0) as u8;
+
+        let bot_r = ((br as f32) * 0.30).clamp(14.0, 26.0) as u8;
+        let bot_g = ((bg as f32) * 0.30).clamp(15.0, 28.0) as u8;
+        let bot_b = ((bb as f32) * 0.30).clamp(18.0, 32.0) as u8;
+
+        return IconProfile::FloatingCutout {
+            top_color: Some(Color::from_rgba8(top_r, top_g, top_b, 255)),
+            bottom_color: Some(Color::from_rgba8(bot_r, bot_g, bot_b, 255)),
+        };
+    }
+
+    IconProfile::FloatingCutout {
+        top_color: None,
+        bottom_color: None,
+    }
 }
 
 /// Analyzes whether an icon's corners are transparent (floating cutout / circle).
@@ -315,17 +376,20 @@ pub fn apply_squircle_plate(source: &Pixmap, options: PlateOptions) -> Pixmap {
 
     // 2. Identify icon archetype
     let profile = match options.strategy {
-        MattingStrategy::AlwaysPlate => IconProfile::FloatingCutout,
+        MattingStrategy::AlwaysPlate => match detect_icon_profile(source) {
+            IconProfile::FloatingCutout { top_color, bottom_color } => {
+                IconProfile::FloatingCutout { top_color, bottom_color }
+            }
+            _ => IconProfile::FloatingCutout {
+                top_color: None,
+                bottom_color: None,
+            },
+        },
         MattingStrategy::SquircleClipOnly => IconProfile::FullBleed,
         MattingStrategy::Auto => detect_icon_profile(source),
         MattingStrategy::Raw => unreachable!(),
     };
 
-    // 3. Render according to archetype
-    let border_color = match options.theme {
-        PlateTheme::Light => Color::from_rgba8(0, 0, 0, 20),
-        PlateTheme::Dark => Color::from_rgba8(255, 255, 255, 30),
-    };
 
     let pixmap_paint = PixmapPaint {
         quality: tiny_skia::FilterQuality::Bicubic,
@@ -405,12 +469,16 @@ pub fn apply_squircle_plate(source: &Pixmap, options: PlateOptions) -> Pixmap {
             let transform = Transform::from_scale(scale, scale).post_translate(dx, dy);
             output.draw_pixmap(0, 0, source.as_ref(), &pixmap_paint, transform, Some(&mask));
         }
-        IconProfile::FloatingCutout => {
-            // Floating glyph / cutout (Chrome, CMake, Fcitx5, lstopo):
-            // Render Apple-style subtle gradient plate and center glyph
-            let (top_color, bottom_color) = match options.theme {
-                PlateTheme::Light => (Color::WHITE, Color::from_rgba8(242, 242, 247, 255)),
-                PlateTheme::Dark => (Color::from_rgba8(48, 48, 51, 255), Color::from_rgba8(28, 28, 30, 255)),
+        IconProfile::FloatingCutout { top_color: extracted_top, bottom_color: extracted_bottom } => {
+            // Floating glyph / cutout (Chrome, CMake, Fcitx5, lstopo, Alacritty):
+            // Intelligently use extracted adaptive plate colors if available, otherwise theme defaults
+            let (top_color, bottom_color) = match (extracted_top, extracted_bottom) {
+                (Some(t), Some(b)) => (t, b),
+                (Some(t), None) => (t, t),
+                _ => match options.theme {
+                    PlateTheme::Light => (Color::WHITE, Color::from_rgba8(242, 242, 247, 255)),
+                    PlateTheme::Dark => (Color::from_rgba8(48, 48, 51, 255), Color::from_rgba8(28, 28, 30, 255)),
+                },
             };
             let mut plate_paint = Paint::default();
             if let Some(shader) = LinearGradient::new(
@@ -434,7 +502,25 @@ pub fn apply_squircle_plate(source: &Pixmap, options: PlateOptions) -> Pixmap {
         }
     }
 
-    // Subtle hairline inner border clipped strictly inside squircle
+    // Subtle hairline inner border clipped strictly inside squircle.
+    // When the plate surface is dark (either from Dark theme or extracted dark tones),
+    // use a crisp translucent white stroke (rgba 255, 255, 255, 30) to catch the rim light.
+    let is_dark_surface = match profile {
+        IconProfile::FloatingCutout { top_color: Some(top), .. } => {
+            let lum = 0.299 * top.red() + 0.587 * top.green() + 0.114 * top.blue();
+            lum < 0.45
+        }
+        _ => options.theme == PlateTheme::Dark,
+    };
+    let border_color = if is_dark_surface {
+        Color::from_rgba8(255, 255, 255, 30)
+    } else {
+        match options.theme {
+            PlateTheme::Light => Color::from_rgba8(0, 0, 0, 20),
+            PlateTheme::Dark => Color::from_rgba8(255, 255, 255, 30),
+        }
+    };
+
     let border_width = (w / 128.0).max(1.0);
     let mut stroke_paint = Paint::default();
     stroke_paint.set_color(border_color);
@@ -554,10 +640,18 @@ mod tests {
                     matches!(profile, IconProfile::FullBleed),
                     "{name} expected FullBleed, got {:?}", profile
                 ),
-                "cutout" => assert!(
-                    matches!(profile, IconProfile::FloatingCutout),
-                    "{name} expected FloatingCutout, got {:?}", profile
-                ),
+                "cutout" => {
+                    assert!(
+                        matches!(profile, IconProfile::FloatingCutout { .. }),
+                        "{name} expected FloatingCutout, got {:?}", profile
+                    );
+                    if name == "Alacritty" {
+                        if let IconProfile::FloatingCutout { top_color, bottom_color } = profile {
+                            assert!(top_color.is_some(), "Alacritty should have extracted dark adaptive plate top color");
+                            assert!(bottom_color.is_some(), "Alacritty should have extracted dark adaptive plate bottom color");
+                        }
+                    }
+                }
                 _ => {}
             }
         }
