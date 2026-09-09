@@ -7,6 +7,7 @@
 //! - Intelligent matting: automated cutout/circle detection and subtle Apple-style background plate generation.
 //! - High-performance raster output, PNG encoding, data URIs, and SVG-wrapped embeds.
 
+pub mod disk_cache;
 pub mod fallback;
 pub mod lookup;
 pub mod plate;
@@ -167,9 +168,24 @@ impl AppIconEngine {
             } else {
                 resolve_icon(name_or_path)?
             };
-            let raw_pixmap = rasterize_file(&path, size, size).ok()?;
-            let framed = apply_squircle_plate(&raw_pixmap, options);
-            IconBitmap::from_pixmap(framed)
+            let disk_target = disk_cache::compute_cache_key(
+                &path,
+                size,
+                options.strategy as u8,
+                options.theme as u8,
+            );
+            if let Some((_, cache_path)) = &disk_target
+                && let Some(pixmap) = disk_cache::load_from_disk(cache_path, size)
+            {
+                IconBitmap::from_pixmap(pixmap)
+            } else {
+                let raw_pixmap = rasterize_file(&path, size, size).ok()?;
+                let framed = apply_squircle_plate(&raw_pixmap, options);
+                if let Some((_, cache_path)) = &disk_target {
+                    disk_cache::save_to_disk(cache_path, &framed);
+                }
+                IconBitmap::from_pixmap(framed)
+            }
         };
         let svg_markup = bitmap.to_svg_markup();
 
