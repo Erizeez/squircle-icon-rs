@@ -34,10 +34,23 @@ pub enum MattingStrategy {
 pub struct PlateOptions {
     pub strategy: MattingStrategy,
     pub theme: PlateTheme,
-    /// Relative corner radius as a ratio of half-size (Apple default is 0.444).
+    /// Relative corner radius as a ratio of half-size (Apple default is 0.444, or 0.50 for 10:20:10 ratio).
     pub corner_radius_ratio: f32,
     /// Relative scale of the inner glyph when placed on a plate (Apple standard ~0.80).
     pub glyph_scale: f32,
+}
+
+impl PlateOptions {
+    /// Authentic Apple 10:20:10 curvature ratio (10px corner radius, 20px straight edge per 40px icon).
+    /// Expressed as a half-size ratio: 0.50 * (width / 2.0) = width * 0.25.
+    pub const CORNER_RATIO_10_20_10: f32 = 0.50;
+
+    /// Configures the plate to use authentic 10:20:10 curvature proportions.
+    #[must_use]
+    pub const fn with_10_20_10_curvature(mut self) -> Self {
+        self.corner_radius_ratio = Self::CORNER_RATIO_10_20_10;
+        self
+    }
 }
 
 impl Default for PlateOptions {
@@ -45,7 +58,7 @@ impl Default for PlateOptions {
         Self {
             strategy: MattingStrategy::Auto,
             theme: PlateTheme::Light,
-            corner_radius_ratio: 0.444,
+            corner_radius_ratio: Self::CORNER_RATIO_10_20_10,
             glyph_scale: 0.80,
         }
     }

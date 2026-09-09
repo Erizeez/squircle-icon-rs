@@ -1,6 +1,6 @@
 [package]
 name = "squircle-icon-rs"
-version = "0.1.12"
+version = "0.1.13"
 edition = "2024"
 license = "MIT"
 description = "Apple macOS HIG-compliant application icon lookup, squircle clipping, intelligent matting, and multi-format rasterizer"
@@ -8,8 +8,19 @@ repository = "https://github.com/Erizeez/squircle-icon-rs"
 readme = "README.md"
 
 [dependencies]
-squircle-rs = { path = "../squircle-rs", version = "0.1.1" }
+squircle-rs = { git = "https://github.com/Erizeez/squircle-rs", tag = "v0.1.2" }
 tiny-skia = "0.11"
 resvg = "0.45"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 png = "0.17"
+
+[dev-dependencies]
+liquid-rs = { git = "https://github.com/Erizeez/liquid-rs", tag = "v0.1.0" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+wgpu = "27.0.1"
+pollster = "0.4"
+
+[[example]]
+name = "liquid_layered_demo"
+path = "examples/liquid_layered_demo.rs"
